@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * otod: a streaming relay for YouTube audio.
+ * koed: a streaming relay for YouTube audio.
  *
  * Clients (e.g. a phone browser) that play a googlevideo audio URL directly
  * are throttled to roughly the playback bitrate when they fetch the file
@@ -40,11 +40,11 @@ const ROUTE_RE = /^\/([^/]+)\/([^/]+)$/;
 function loadConfig(env = process.env) {
   const home = os.homedir();
   return {
-    host: env.OTOD_HOST || '127.0.0.1',
-    port: Number(env.OTOD_PORT || 8791),
-    token: env.OTOD_TOKEN || null,
+    host: env.KOED_HOST || '127.0.0.1',
+    port: Number(env.KOED_PORT || 8791),
+    token: env.KOED_TOKEN || null,
     tokenFile:
-      env.OTOD_TOKEN_FILE || path.join(home, '.config/otod/token'),
+      env.KOED_TOKEN_FILE || path.join(home, '.config/koed/token'),
     batchCacheFile:
       env.YT_AUDIO_CACHE || path.join(home, '.yt-audio/cache.json'),
   };
@@ -208,7 +208,7 @@ async function handle(cfg, state, token, req, res) {
     try {
       meta = await getMeta(cfg, state, videoId, retried);
     } catch (e) {
-      console.error(`[otod] meta failed for ${videoId}: ${e.message}`);
+      console.error(`[koed] meta failed for ${videoId}: ${e.message}`);
       meta = null;
     }
     if (!meta) {
@@ -283,7 +283,7 @@ async function handle(cfg, state, token, req, res) {
       }
       if (tracker.committed && !res.writableEnded) res.destroy();
       if (e.code !== 'UPSTREAM_EXPIRED') {
-        console.error(`[otod] stream failed for ${videoId}: ${e.message}`);
+        console.error(`[koed] stream failed for ${videoId}: ${e.message}`);
       }
       return;
     }
@@ -326,7 +326,7 @@ function createServer(cfg) {
   const state = { meta: new Map() };
   const server = http.createServer((req, res) => {
     handle(cfg, state, token, req, res).catch((e) => {
-      console.error(`[otod] handler error: ${e.message}`);
+      console.error(`[koed] handler error: ${e.message}`);
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'text/plain' });
       }
