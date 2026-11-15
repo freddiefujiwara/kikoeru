@@ -60,8 +60,13 @@ address and the time it was found:
 
 The rules are simple:
 
-- Entry exists and is less than 5 hours old → kikoeru relays the sound.
-- Entry is missing or older than 5 hours → kikoeru answers 404.
+- Entry exists and its sound address has not expired yet → kikoeru
+  relays the sound. Sound addresses carry their own expiry time
+  (an `expire` value in the address, about 6 hours after the address
+  was found), and kikoeru serves the address until just before that
+  time. An address with no readable expiry is used until 6 hours
+  after it was found.
+- Entry is missing or its address has expired → kikoeru answers 404.
   (The shell pipeline will find a fresh address on its next run.)
 
 Sound addresses stop working after some hours. If YouTube answers

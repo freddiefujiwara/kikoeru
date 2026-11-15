@@ -17,8 +17,10 @@
  * Stream URL resolution is NOT this server's job. Extracting stream URLs
  * with yt-dlp belongs to the shell pipeline (yt-audio / yt-audio-batch);
  * this server only reads its cache (~/.yt-audio/cache.json) and relays:
- *   - entry present and younger than 5 h -> relay that URL.
- *   - entry missing or stale -> 404 (the shell refreshes it on its cycle).
+ *   - entry present and its URL not yet expired -> relay that URL.
+ *     (The URL's own `expire` parameter decides; a URL without one is
+ *     used until 6 h after its extraction time.)
+ *   - entry missing or expired -> 404 (the shell refreshes it on its cycle).
  * If the upstream answers 403 (URL expired server-side), the batch cache
  * is re-read once (the shell may have refreshed it in the meantime) and
  * the request is retried; if that still fails, the answer is 404.
@@ -36,7 +38,8 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 
 const CHUNK_SIZE = 4 * 1024 * 1024; // upstream sub-range size
-const FRESH_SEC = 5 * 3600; // cached stream URLs are reused for 5 hours
+const FALLBACK_FRESH_SEC = 6 * 3600; // no expire param: ts + 6 h decides
+const EXPIRY_MARGIN_SEC = 60; // stop serving this long before a URL expires
 const META_TTL_MS = 50 * 60 * 1000; // resolved size/type/final-URL cache
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 const ROUTE_RE = /^\/([^/]+)\/([^/]+)$/;
@@ -77,16 +80,44 @@ function readJsonFile(file) {
 }
 
 /**
- * Resolve a fresh-enough stream URL for the video from the shell
+ * The expiry (epoch seconds) a googlevideo stream URL carries in its
+ * `expire` query parameter, or null when the URL has none that parses.
+ */
+function urlExpirySec(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  const raw = parsed.searchParams.get('expire');
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+}
+
+/**
+ * Resolve a still-usable stream URL for the video from the shell
  * pipeline's batch cache, or null. This server never extracts URLs
  * itself (no yt-dlp, no cache of its own).
+ *
+ * Usability follows the URL itself: googlevideo URLs carry an
+ * `expire` parameter (epoch seconds, roughly 6 h after extraction)
+ * and are served until just before that moment. URLs without a
+ * parseable `expire` fall back to the extraction timestamp plus
+ * FALLBACK_FRESH_SEC.
  */
 function resolveStreamUrl(cfg, videoId) {
   const batch = readJsonFile(cfg.batchCacheFile);
   const entry = batch && batch[videoId];
   if (!entry || !entry.url) return null;
   const now = Math.floor(Date.now() / 1000);
-  if (now - (entry.ts || 0) >= FRESH_SEC) return null;
+  const exp = urlExpirySec(entry.url);
+  if (exp !== null) {
+    return now < exp - EXPIRY_MARGIN_SEC ? entry.url : null;
+  }
+  const ts = entry.ts || 0;
+  if (!ts || now - ts >= FALLBACK_FRESH_SEC) return null;
   return entry.url;
 }
 
@@ -357,6 +388,8 @@ module.exports = {
   ensureToken,
   parseRange,
   resolveStreamUrl,
+  urlExpirySec,
   CHUNK_SIZE,
-  FRESH_SEC,
+  FALLBACK_FRESH_SEC,
+  EXPIRY_MARGIN_SEC,
 };
