@@ -181,6 +181,14 @@ environment variable.
 | `KIKOERU_TOKEN` | (contents of the token file) | The shared secret |
 | `KIKOERU_TOKEN_FILE` | `~/.config/kikoeru/token` | Where the token is kept |
 | `YT_AUDIO_CACHE` | `~/.yt-audio/cache.json` | The shell pipeline's cache file |
+| `KIKOERU_CHUNK_SIZE` | `4194304` | Size of one upstream piece, in bytes |
+| `KIKOERU_FALLBACK_FRESH_SEC` | `21600` | How long an address with no readable expiry is used, in seconds |
+| `KIKOERU_EXPIRY_MARGIN_SEC` | `60` | Stop using an address this many seconds before it expires |
+| `KIKOERU_META_TTL_MS` | `3000000` | How long a resolved size and type are remembered, in milliseconds |
+
+The four numeric settings must be positive numbers. A value that is
+not a number, or is zero or negative, is ignored and the default is
+used instead.
 
 ## Example
 

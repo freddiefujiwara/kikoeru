@@ -44,9 +44,37 @@ const META_TTL_MS = 50 * 60 * 1000; // resolved size/type/final-URL cache
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 const ROUTE_RE = /^\/([^/]+)\/([^/]+)$/;
 
+function positiveNumber(raw, fallback) {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function positiveInt(raw, fallback) {
+  return Math.max(1, Math.floor(positiveNumber(raw, fallback)));
+}
+
+/**
+ * Fill the numeric knobs of a config object with validated values.
+ * loadConfig feeds it the raw environment strings; createServer and
+ * resolveStreamUrl run it too, so a hand-built config object gets
+ * the same treatment. Anything that is not a positive number falls
+ * back to the built-in default, so a typo can never change the
+ * behaviour silently.
+ */
+function normalizeConfig(cfg) {
+  const c = cfg || {};
+  return {
+    ...c,
+    chunkSize: positiveInt(c.chunkSize, CHUNK_SIZE),
+    fallbackFreshSec: positiveNumber(c.fallbackFreshSec, FALLBACK_FRESH_SEC),
+    expiryMarginSec: positiveNumber(c.expiryMarginSec, EXPIRY_MARGIN_SEC),
+    metaTtlMs: positiveNumber(c.metaTtlMs, META_TTL_MS),
+  };
+}
+
 function loadConfig(env = process.env) {
   const home = os.homedir();
-  return {
+  return normalizeConfig({
     host: env.KIKOERU_HOST || '127.0.0.1',
     port: Number(env.KIKOERU_PORT || 8791),
     token: env.KIKOERU_TOKEN || null,
@@ -54,7 +82,11 @@ function loadConfig(env = process.env) {
       env.KIKOERU_TOKEN_FILE || path.join(home, '.config/kikoeru/token'),
     batchCacheFile:
       env.YT_AUDIO_CACHE || path.join(home, '.yt-audio/cache.json'),
-  };
+    chunkSize: env.KIKOERU_CHUNK_SIZE,
+    fallbackFreshSec: env.KIKOERU_FALLBACK_FRESH_SEC,
+    expiryMarginSec: env.KIKOERU_EXPIRY_MARGIN_SEC,
+    metaTtlMs: env.KIKOERU_META_TTL_MS,
+  });
 }
 
 function ensureToken(cfg) {
@@ -108,16 +140,17 @@ function urlExpirySec(url) {
  * FALLBACK_FRESH_SEC.
  */
 function resolveStreamUrl(cfg, videoId) {
-  const batch = readJsonFile(cfg.batchCacheFile);
+  const c = normalizeConfig(cfg);
+  const batch = readJsonFile(c.batchCacheFile);
   const entry = batch && batch[videoId];
   if (!entry || !entry.url) return null;
   const now = Math.floor(Date.now() / 1000);
   const exp = urlExpirySec(entry.url);
   if (exp !== null) {
-    return now < exp - EXPIRY_MARGIN_SEC ? entry.url : null;
+    return now < exp - c.expiryMarginSec ? entry.url : null;
   }
   const ts = entry.ts || 0;
-  if (!ts || now - ts >= FALLBACK_FRESH_SEC) return null;
+  if (!ts || now - ts >= c.fallbackFreshSec) return null;
   return entry.url;
 }
 
@@ -175,7 +208,7 @@ async function probeMeta(startUrl) {
 async function getMeta(cfg, state, videoId, force = false) {
   if (!force) {
     const hit = state.meta.get(videoId);
-    if (hit && Date.now() - hit.at < META_TTL_MS) return hit;
+    if (hit && Date.now() - hit.at < cfg.metaTtlMs) return hit;
   }
   const url = resolveStreamUrl(cfg, videoId);
   if (!url) return null;
@@ -280,7 +313,7 @@ async function handle(cfg, state, token, req, res) {
     // re-read batch cache.
     const tracker = { committed: false, wrote: false };
     try {
-      const firstEnd = Math.min(start + CHUNK_SIZE - 1, end);
+      const firstEnd = Math.min(start + cfg.chunkSize - 1, end);
       const up = await openUpstream(meta.finalUrl, {
         Range: `bytes=${start}-${firstEnd}`,
       });
@@ -306,7 +339,14 @@ async function handle(cfg, state, token, req, res) {
         }
       }
       if (firstEnd < end) {
-        await streamRest(meta.finalUrl, firstEnd + 1, end, res, tracker);
+        await streamRest(
+          meta.finalUrl,
+          firstEnd + 1,
+          end,
+          res,
+          tracker,
+          cfg.chunkSize,
+        );
       }
       res.end();
       return;
@@ -336,11 +376,11 @@ async function handle(cfg, state, token, req, res) {
   }
 }
 
-async function streamRest(finalUrl, start, end, res, tracker) {
+async function streamRest(finalUrl, start, end, res, tracker, chunkSize) {
   let pos = start;
   while (pos <= end) {
     if (res.destroyed || res.writableEnded) return;
-    const chunkEnd = Math.min(pos + CHUNK_SIZE - 1, end);
+    const chunkEnd = Math.min(pos + chunkSize - 1, end);
     const up = await openUpstream(finalUrl, {
       Range: `bytes=${pos}-${chunkEnd}`,
     });
@@ -368,10 +408,11 @@ async function streamRest(finalUrl, start, end, res, tracker) {
 }
 
 function createServer(cfg) {
-  const token = ensureToken(cfg);
+  const full = normalizeConfig(cfg);
+  const token = ensureToken(full);
   const state = { meta: new Map() };
   const server = http.createServer((req, res) => {
-    handle(cfg, state, token, req, res).catch((e) => {
+    handle(full, state, token, req, res).catch((e) => {
       console.error(`[kikoeru] handler error: ${e.message}`);
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'text/plain' });
@@ -385,6 +426,7 @@ function createServer(cfg) {
 module.exports = {
   createServer,
   loadConfig,
+  normalizeConfig,
   ensureToken,
   parseRange,
   resolveStreamUrl,
@@ -392,4 +434,5 @@ module.exports = {
   CHUNK_SIZE,
   FALLBACK_FRESH_SEC,
   EXPIRY_MARGIN_SEC,
+  META_TTL_MS,
 };

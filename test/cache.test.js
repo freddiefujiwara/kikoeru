@@ -284,3 +284,27 @@ test('resolveStreamUrl returns null for a fresh entry whose URL expired', () => 
   const file = cacheWith(entry);
   assert.equal(resolveStreamUrl({ batchCacheFile: file }, VIDEO_ID), null);
 });
+
+test('resolveStreamUrl honours an expiryMarginSec override', () => {
+  // The URL stays valid for another 30 minutes: fine with the
+  // default 60-second margin, unusable with a 1-hour margin.
+  const entry = expiringEntry(nowSec(), nowSec() + 1800);
+  const file = cacheWith(entry);
+  assert.equal(resolveStreamUrl({ batchCacheFile: file }, VIDEO_ID), entry.url);
+  assert.equal(
+    resolveStreamUrl({ batchCacheFile: file, expiryMarginSec: 3600 }, VIDEO_ID),
+    null,
+  );
+});
+
+test('resolveStreamUrl honours a fallbackFreshSec override', () => {
+  // Extracted 1 hour ago, no expire parameter: fine with the
+  // default 6-hour window, stale with a 30-minute window.
+  const entry = goodEntry(nowSec() - 3600);
+  const file = cacheWith(entry);
+  assert.equal(resolveStreamUrl({ batchCacheFile: file }, VIDEO_ID), entry.url);
+  assert.equal(
+    resolveStreamUrl({ batchCacheFile: file, fallbackFreshSec: 1800 }, VIDEO_ID),
+    null,
+  );
+});
