@@ -140,3 +140,43 @@ test('a client range inside one chunk causes exactly one data request', async ()
   const dataRequests = splitProbe(recordedRanges());
   assert.deepEqual(dataRequests, [[1000, 1999]]);
 });
+
+test('a chunkSize override shrinks the upstream sub-ranges', async () => {
+  const small = makeData(5000);
+  const up = makeMediaUpstream(small);
+  const upPort2 = await listen(up.server);
+  const dir = tmpDir();
+  const cache = path.join(dir, 'cache.json');
+  writeCache(cache, {
+    [VIDEO_ID]: { url: `http://127.0.0.1:${upPort2}/media`, ts: nowSec() },
+  });
+  const p = createServer({
+    host: '127.0.0.1',
+    port: 0,
+    token: TOKEN,
+    tokenFile: path.join(dir, 'token'),
+    batchCacheFile: cache,
+    chunkSize: 1024,
+  });
+  const port = await listen(p);
+  try {
+    const r = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, small);
+    const chunks = up.state.requests
+      .filter((q) => q.url === '/media')
+      .map((q) => parseRangeHeader(q.range))
+      .filter(([s, e]) => !(s === 0 && e === 0));
+    assert.deepEqual(chunks, [
+      [0, 1023],
+      [1024, 2047],
+      [2048, 3071],
+      [3072, 4095],
+      [4096, 4999],
+    ]);
+  } finally {
+    await close(p);
+    await close(up.server);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

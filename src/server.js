@@ -17,8 +17,10 @@
  * Stream URL resolution is NOT this server's job. Extracting stream URLs
  * with yt-dlp belongs to the shell pipeline (yt-audio / yt-audio-batch);
  * this server only reads its cache (~/.yt-audio/cache.json) and relays:
- *   - entry present and younger than 5 h -> relay that URL.
- *   - entry missing or stale -> 404 (the shell refreshes it on its cycle).
+ *   - entry present and its URL not yet expired -> relay that URL.
+ *     (The URL's own `expire` parameter decides; a URL without one is
+ *     used until 6 h after its extraction time.)
+ *   - entry missing or expired -> 404 (the shell refreshes it on its cycle).
  * If the upstream answers 403 (URL expired server-side), the batch cache
  * is re-read once (the shell may have refreshed it in the meantime) and
  * the request is retried; if that still fails, the answer is 404.
@@ -36,14 +38,43 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 
 const CHUNK_SIZE = 4 * 1024 * 1024; // upstream sub-range size
-const FRESH_SEC = 5 * 3600; // cached stream URLs are reused for 5 hours
+const FALLBACK_FRESH_SEC = 6 * 3600; // no expire param: ts + 6 h decides
+const EXPIRY_MARGIN_SEC = 60; // stop serving this long before a URL expires
 const META_TTL_MS = 50 * 60 * 1000; // resolved size/type/final-URL cache
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 const ROUTE_RE = /^\/([^/]+)\/([^/]+)$/;
 
+function positiveNumber(raw, fallback) {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function positiveInt(raw, fallback) {
+  return Math.max(1, Math.floor(positiveNumber(raw, fallback)));
+}
+
+/**
+ * Fill the numeric knobs of a config object with validated values.
+ * loadConfig feeds it the raw environment strings; createServer and
+ * resolveStreamUrl run it too, so a hand-built config object gets
+ * the same treatment. Anything that is not a positive number falls
+ * back to the built-in default, so a typo can never change the
+ * behaviour silently.
+ */
+function normalizeConfig(cfg) {
+  const c = cfg || {};
+  return {
+    ...c,
+    chunkSize: positiveInt(c.chunkSize, CHUNK_SIZE),
+    fallbackFreshSec: positiveNumber(c.fallbackFreshSec, FALLBACK_FRESH_SEC),
+    expiryMarginSec: positiveNumber(c.expiryMarginSec, EXPIRY_MARGIN_SEC),
+    metaTtlMs: positiveNumber(c.metaTtlMs, META_TTL_MS),
+  };
+}
+
 function loadConfig(env = process.env) {
   const home = os.homedir();
-  return {
+  return normalizeConfig({
     host: env.KIKOERU_HOST || '127.0.0.1',
     port: Number(env.KIKOERU_PORT || 8791),
     token: env.KIKOERU_TOKEN || null,
@@ -51,7 +82,11 @@ function loadConfig(env = process.env) {
       env.KIKOERU_TOKEN_FILE || path.join(home, '.config/kikoeru/token'),
     batchCacheFile:
       env.YT_AUDIO_CACHE || path.join(home, '.yt-audio/cache.json'),
-  };
+    chunkSize: env.KIKOERU_CHUNK_SIZE,
+    fallbackFreshSec: env.KIKOERU_FALLBACK_FRESH_SEC,
+    expiryMarginSec: env.KIKOERU_EXPIRY_MARGIN_SEC,
+    metaTtlMs: env.KIKOERU_META_TTL_MS,
+  });
 }
 
 function ensureToken(cfg) {
@@ -77,16 +112,45 @@ function readJsonFile(file) {
 }
 
 /**
- * Resolve a fresh-enough stream URL for the video from the shell
+ * The expiry (epoch seconds) a googlevideo stream URL carries in its
+ * `expire` query parameter, or null when the URL has none that parses.
+ */
+function urlExpirySec(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  const raw = parsed.searchParams.get('expire');
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+}
+
+/**
+ * Resolve a still-usable stream URL for the video from the shell
  * pipeline's batch cache, or null. This server never extracts URLs
  * itself (no yt-dlp, no cache of its own).
+ *
+ * Usability follows the URL itself: googlevideo URLs carry an
+ * `expire` parameter (epoch seconds, roughly 6 h after extraction)
+ * and are served until just before that moment. URLs without a
+ * parseable `expire` fall back to the extraction timestamp plus
+ * FALLBACK_FRESH_SEC.
  */
 function resolveStreamUrl(cfg, videoId) {
-  const batch = readJsonFile(cfg.batchCacheFile);
+  const c = normalizeConfig(cfg);
+  const batch = readJsonFile(c.batchCacheFile);
   const entry = batch && batch[videoId];
   if (!entry || !entry.url) return null;
   const now = Math.floor(Date.now() / 1000);
-  if (now - (entry.ts || 0) >= FRESH_SEC) return null;
+  const exp = urlExpirySec(entry.url);
+  if (exp !== null) {
+    return now < exp - c.expiryMarginSec ? entry.url : null;
+  }
+  const ts = entry.ts || 0;
+  if (!ts || now - ts >= c.fallbackFreshSec) return null;
   return entry.url;
 }
 
@@ -144,7 +208,7 @@ async function probeMeta(startUrl) {
 async function getMeta(cfg, state, videoId, force = false) {
   if (!force) {
     const hit = state.meta.get(videoId);
-    if (hit && Date.now() - hit.at < META_TTL_MS) return hit;
+    if (hit && Date.now() - hit.at < cfg.metaTtlMs) return hit;
   }
   const url = resolveStreamUrl(cfg, videoId);
   if (!url) return null;
@@ -249,7 +313,7 @@ async function handle(cfg, state, token, req, res) {
     // re-read batch cache.
     const tracker = { committed: false, wrote: false };
     try {
-      const firstEnd = Math.min(start + CHUNK_SIZE - 1, end);
+      const firstEnd = Math.min(start + cfg.chunkSize - 1, end);
       const up = await openUpstream(meta.finalUrl, {
         Range: `bytes=${start}-${firstEnd}`,
       });
@@ -275,7 +339,14 @@ async function handle(cfg, state, token, req, res) {
         }
       }
       if (firstEnd < end) {
-        await streamRest(meta.finalUrl, firstEnd + 1, end, res, tracker);
+        await streamRest(
+          meta.finalUrl,
+          firstEnd + 1,
+          end,
+          res,
+          tracker,
+          cfg.chunkSize,
+        );
       }
       res.end();
       return;
@@ -305,11 +376,11 @@ async function handle(cfg, state, token, req, res) {
   }
 }
 
-async function streamRest(finalUrl, start, end, res, tracker) {
+async function streamRest(finalUrl, start, end, res, tracker, chunkSize) {
   let pos = start;
   while (pos <= end) {
     if (res.destroyed || res.writableEnded) return;
-    const chunkEnd = Math.min(pos + CHUNK_SIZE - 1, end);
+    const chunkEnd = Math.min(pos + chunkSize - 1, end);
     const up = await openUpstream(finalUrl, {
       Range: `bytes=${pos}-${chunkEnd}`,
     });
@@ -337,10 +408,11 @@ async function streamRest(finalUrl, start, end, res, tracker) {
 }
 
 function createServer(cfg) {
-  const token = ensureToken(cfg);
+  const full = normalizeConfig(cfg);
+  const token = ensureToken(full);
   const state = { meta: new Map() };
   const server = http.createServer((req, res) => {
-    handle(cfg, state, token, req, res).catch((e) => {
+    handle(full, state, token, req, res).catch((e) => {
       console.error(`[kikoeru] handler error: ${e.message}`);
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'text/plain' });
@@ -354,9 +426,13 @@ function createServer(cfg) {
 module.exports = {
   createServer,
   loadConfig,
+  normalizeConfig,
   ensureToken,
   parseRange,
   resolveStreamUrl,
+  urlExpirySec,
   CHUNK_SIZE,
-  FRESH_SEC,
+  FALLBACK_FRESH_SEC,
+  EXPIRY_MARGIN_SEC,
+  META_TTL_MS,
 };

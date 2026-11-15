@@ -74,6 +74,43 @@ test('loadConfig honours every environment override', () => {
   assert.equal(cfg.batchCacheFile, '/tmp/somewhere/cache.json');
 });
 
+test('loadConfig defaults the numeric knobs to the built-in values', () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.chunkSize, 4 * 1024 * 1024);
+  assert.equal(cfg.fallbackFreshSec, 6 * 3600);
+  assert.equal(cfg.expiryMarginSec, 60);
+  assert.equal(cfg.metaTtlMs, 50 * 60 * 1000);
+});
+
+test('loadConfig honours the numeric knob overrides', () => {
+  const cfg = loadConfig({
+    KIKOERU_CHUNK_SIZE: '1048576',
+    KIKOERU_FALLBACK_FRESH_SEC: '7200',
+    KIKOERU_EXPIRY_MARGIN_SEC: '300',
+    KIKOERU_META_TTL_MS: '60000',
+  });
+  assert.equal(cfg.chunkSize, 1048576);
+  assert.equal(cfg.fallbackFreshSec, 7200);
+  assert.equal(cfg.expiryMarginSec, 300);
+  assert.equal(cfg.metaTtlMs, 60000);
+});
+
+test('loadConfig falls back to the defaults for invalid knob values', () => {
+  for (const bad of ['abc', '0', '-5', '']) {
+    const cfg = loadConfig({
+      KIKOERU_CHUNK_SIZE: bad,
+      KIKOERU_FALLBACK_FRESH_SEC: bad,
+      KIKOERU_EXPIRY_MARGIN_SEC: bad,
+      KIKOERU_META_TTL_MS: bad,
+    });
+    const label = JSON.stringify(bad);
+    assert.equal(cfg.chunkSize, 4 * 1024 * 1024, `chunkSize for ${label}`);
+    assert.equal(cfg.fallbackFreshSec, 6 * 3600, `fallbackFreshSec for ${label}`);
+    assert.equal(cfg.expiryMarginSec, 60, `expiryMarginSec for ${label}`);
+    assert.equal(cfg.metaTtlMs, 50 * 60 * 1000, `metaTtlMs for ${label}`);
+  }
+});
+
 // --- ensureToken ----------------------------------------------------------------
 
 test('ensureToken returns the configured token without touching the file', () => {

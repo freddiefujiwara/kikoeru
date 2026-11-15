@@ -60,8 +60,13 @@ address and the time it was found:
 
 The rules are simple:
 
-- Entry exists and is less than 5 hours old → kikoeru relays the sound.
-- Entry is missing or older than 5 hours → kikoeru answers 404.
+- Entry exists and its sound address has not expired yet → kikoeru
+  relays the sound. Sound addresses carry their own expiry time
+  (an `expire` value in the address, about 6 hours after the address
+  was found), and kikoeru serves the address until just before that
+  time. An address with no readable expiry is used until 6 hours
+  after it was found.
+- Entry is missing or its address has expired → kikoeru answers 404.
   (The shell pipeline will find a fresh address on its next run.)
 
 Sound addresses stop working after some hours. If YouTube answers
@@ -176,6 +181,14 @@ environment variable.
 | `KIKOERU_TOKEN` | (contents of the token file) | The shared secret |
 | `KIKOERU_TOKEN_FILE` | `~/.config/kikoeru/token` | Where the token is kept |
 | `YT_AUDIO_CACHE` | `~/.yt-audio/cache.json` | The shell pipeline's cache file |
+| `KIKOERU_CHUNK_SIZE` | `4194304` | Size of one upstream piece, in bytes |
+| `KIKOERU_FALLBACK_FRESH_SEC` | `21600` | How long an address with no readable expiry is used, in seconds |
+| `KIKOERU_EXPIRY_MARGIN_SEC` | `60` | Stop using an address this many seconds before it expires |
+| `KIKOERU_META_TTL_MS` | `3000000` | How long a resolved size and type are remembered, in milliseconds |
+
+The four numeric settings must be positive numbers. A value that is
+not a number, or is zero or negative, is ignored and the default is
+used instead.
 
 ## Example
 

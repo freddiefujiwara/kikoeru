@@ -104,12 +104,15 @@ function makeMediaUpstream(data, contentType = 'audio/mp4') {
     const range = req.headers.range || null;
     state.requests.push({ url: req.url, range });
     if (!range) state.plainGets++;
-    if (req.url === '/redir') {
+    // Route on the pathname only: stream URLs may carry a query
+    // string (e.g. ?expire=...) and must still reach /media.
+    const pathname = (req.url || '').split('?')[0];
+    if (pathname === '/redir') {
       res.writeHead(302, { Location: '/media' });
       res.end();
       return;
     }
-    if (req.url !== '/media') {
+    if (pathname !== '/media') {
       res.writeHead(404);
       res.end();
       return;
