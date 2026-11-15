@@ -22,6 +22,10 @@
  * If the upstream answers 403 (URL expired server-side), the batch cache
  * is re-read once (the shell may have refreshed it in the meantime) and
  * the request is retried; if that still fails, the answer is 404.
+ *
+ * A failure while streaming is always answered, never left hanging:
+ * before the response is committed the client gets a 502, and once
+ * bytes are flowing the response is cut short instead.
  */
 
 const http = require('node:http');
@@ -281,9 +285,20 @@ async function handle(cfg, state, token, req, res) {
         retried = true;
         continue;
       }
-      if (tracker.committed && !res.writableEnded) res.destroy();
       if (e.code !== 'UPSTREAM_EXPIRED') {
         console.error(`[koed] stream failed for ${videoId}: ${e.message}`);
+      }
+      if (!tracker.committed && !res.headersSent && !res.writableEnded) {
+        // Nothing has been sent to the client yet, so the failure can
+        // still be answered honestly: 502, promptly, instead of
+        // leaving the request hanging until the client gives up.
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end('bad gateway\n');
+      } else if (!res.writableEnded) {
+        // The status line (and possibly part of the body) is already
+        // out, so no error status can be sent. Cut the response so
+        // the client is not left waiting for bytes that never come.
+        res.destroy();
       }
       return;
     }

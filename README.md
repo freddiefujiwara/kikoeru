@@ -67,7 +67,14 @@ The rules are simple:
 Sound addresses stop working after some hours. If YouTube answers
 403 ("forbidden") while koed is working, koed reads the cache file
 one more time — the shell pipeline may have put a fresh address in
-it — and tries once more. If it still fails, koed answers 404.
+it — and tries once more. If the address still does not work, koed
+answers 404.
+
+If YouTube fails while the sound is being sent, koed never leaves
+the listener waiting. When no sound has been sent yet, koed answers
+502 ("bad gateway") at once. When some sound has already been sent,
+koed ends the connection at once, so the player can show an error
+instead of waiting for ever.
 
 Built for the [reader](https://github.com/freddiefujiwara/reader)
 web RSS reader, which plays YouTube videos like podcasts.

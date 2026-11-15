@@ -49,8 +49,8 @@ function get(port, p, headers = {}) {
 }
 
 // Resolves { timedOut: true } when no response arrives within `ms`.
-// Used to pin down the current behaviour for mid-stream upstream
-// errors, where the handler gives up without answering.
+// Used to prove that upstream errors are answered promptly: the
+// caller asserts timedOut is false and checks the status.
 function getExpectTimeout(port, p, headers = {}, ms = 2000) {
   return new Promise((resolve) => {
     let done = false;
