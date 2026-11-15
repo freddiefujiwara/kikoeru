@@ -51,7 +51,7 @@ test('loadConfig uses the documented defaults', () => {
   assert.equal(cfg.token, null);
   assert.equal(
     cfg.tokenFile,
-    path.join(os.homedir(), '.config/koed/token'),
+    path.join(os.homedir(), '.config/kikoeru/token'),
   );
   assert.equal(
     cfg.batchCacheFile,
@@ -61,10 +61,10 @@ test('loadConfig uses the documented defaults', () => {
 
 test('loadConfig honours every environment override', () => {
   const cfg = loadConfig({
-    KOED_HOST: '0.0.0.0',
-    KOED_PORT: '9999',
-    KOED_TOKEN: 'from-env',
-    KOED_TOKEN_FILE: '/tmp/somewhere/token',
+    KIKOERU_HOST: '0.0.0.0',
+    KIKOERU_PORT: '9999',
+    KIKOERU_TOKEN: 'from-env',
+    KIKOERU_TOKEN_FILE: '/tmp/somewhere/token',
     YT_AUDIO_CACHE: '/tmp/somewhere/cache.json',
   });
   assert.equal(cfg.host, '0.0.0.0');

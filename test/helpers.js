@@ -1,6 +1,6 @@
 'use strict';
 
-// Shared helpers for the koed test suites. This file is not a test
+// Shared helpers for the kikoeru test suites. This file is not a test
 // itself (it does not match the *.test.js glob); it only builds fake
 // upstreams, temp dirs and small HTTP clients so every suite can stay
 // off the real network.
@@ -81,7 +81,7 @@ function makeData(size) {
 }
 
 function tmpDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'koed-test-'));
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'kikoeru-test-'));
 }
 
 function writeCache(file, obj) {

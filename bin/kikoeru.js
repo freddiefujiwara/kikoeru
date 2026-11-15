@@ -7,6 +7,6 @@ const cfg = loadConfig();
 const server = createServer(cfg);
 server.listen(cfg.port, cfg.host, () => {
   console.log(
-    `[koed] listening on http://${cfg.host}:${cfg.port}/<token>/<videoId>`,
+    `[kikoeru] listening on http://${cfg.host}:${cfg.port}/<token>/<videoId>`,
   );
 });

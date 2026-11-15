@@ -1,6 +1,6 @@
 'use strict';
 
-// The whole point of koed: the upstream is only ever asked for small
+// The whole point of kikoeru: the upstream is only ever asked for small
 // ranged pieces (<= 4 MiB), never for a plain GET and never for one
 // big range. These tests record every Range header the fake upstream
 // receives for a > 10 MiB payload and check the pieces exactly: size,

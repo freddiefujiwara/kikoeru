@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * koed: a streaming relay for YouTube audio.
+ * kikoeru: a streaming relay for YouTube audio.
  *
  * Clients (e.g. a phone browser) that play a googlevideo audio URL directly
  * are throttled to roughly the playback bitrate when they fetch the file
@@ -44,11 +44,11 @@ const ROUTE_RE = /^\/([^/]+)\/([^/]+)$/;
 function loadConfig(env = process.env) {
   const home = os.homedir();
   return {
-    host: env.KOED_HOST || '127.0.0.1',
-    port: Number(env.KOED_PORT || 8791),
-    token: env.KOED_TOKEN || null,
+    host: env.KIKOERU_HOST || '127.0.0.1',
+    port: Number(env.KIKOERU_PORT || 8791),
+    token: env.KIKOERU_TOKEN || null,
     tokenFile:
-      env.KOED_TOKEN_FILE || path.join(home, '.config/koed/token'),
+      env.KIKOERU_TOKEN_FILE || path.join(home, '.config/kikoeru/token'),
     batchCacheFile:
       env.YT_AUDIO_CACHE || path.join(home, '.yt-audio/cache.json'),
   };
@@ -212,7 +212,7 @@ async function handle(cfg, state, token, req, res) {
     try {
       meta = await getMeta(cfg, state, videoId, retried);
     } catch (e) {
-      console.error(`[koed] meta failed for ${videoId}: ${e.message}`);
+      console.error(`[kikoeru] meta failed for ${videoId}: ${e.message}`);
       meta = null;
     }
     if (!meta) {
@@ -286,7 +286,7 @@ async function handle(cfg, state, token, req, res) {
         continue;
       }
       if (e.code !== 'UPSTREAM_EXPIRED') {
-        console.error(`[koed] stream failed for ${videoId}: ${e.message}`);
+        console.error(`[kikoeru] stream failed for ${videoId}: ${e.message}`);
       }
       if (!tracker.committed && !res.headersSent && !res.writableEnded) {
         // Nothing has been sent to the client yet, so the failure can
@@ -341,7 +341,7 @@ function createServer(cfg) {
   const state = { meta: new Map() };
   const server = http.createServer((req, res) => {
     handle(cfg, state, token, req, res).catch((e) => {
-      console.error(`[koed] handler error: ${e.message}`);
+      console.error(`[kikoeru] handler error: ${e.message}`);
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'text/plain' });
       }
