@@ -13,7 +13,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { createServer } = require('../src/server');
+const { createServer, CHUNK_SIZE } = require('../src/server');
 const {
   listen,
   close,
@@ -186,17 +186,17 @@ test('403 on the first data chunk retries with the refreshed cache URL', async (
   assert.ok(hits['/good'] >= 2, 'the refreshed URL is probed and streamed');
 });
 
-test('403 on a data chunk with no cache refresh gives up (no answer)', async () => {
-  // Current behaviour: the retry re-reads the same dead URL, the
-  // probe fails with 403, and the handler returns without answering.
-  // The client therefore sees no response at all. This test pins
-  // that behaviour down; it does not claim it is ideal.
+test('403 on a data chunk with no cache refresh gives a prompt 502', async () => {
+  // The retry re-reads the same dead URL and fails again. Nothing
+  // has been sent to the client at that point, so koed must answer
+  // promptly with 502 instead of leaving the request hanging.
   hits = {};
   onFlakyChunk = () => {};
   try {
     await withServerAt('/flaky', async (port) => {
       const r = await getExpectTimeout(port, `/${TOKEN}/${VIDEO_ID}`);
-      assert.equal(r.timedOut, true, 'expected no response from koed');
+      assert.equal(r.timedOut, false, 'koed must answer, not hang');
+      assert.equal(r.status, 502);
     });
   } finally {
     onFlakyChunk = null;
@@ -210,13 +210,102 @@ test('500 on the probe gives 404', async () => {
   });
 });
 
-test('500 on a data chunk gives up without an answer (current behaviour)', async () => {
-  // Same known behaviour as the unrefreshed 403 above: a non-403
-  // error mid-stream is logged and the handler returns silently.
+test('500 on a data chunk gives a prompt 502', async () => {
+  // A non-403 error on the first data chunk happens before anything
+  // is sent to the client, so it is answered with a prompt 502.
   await withServerAt('/chunk500', async (port) => {
     const r = await getExpectTimeout(port, `/${TOKEN}/${VIDEO_ID}`);
-    assert.equal(r.timedOut, true, 'expected no response from koed');
+    assert.equal(r.timedOut, false, 'koed must answer, not hang');
+    assert.equal(r.status, 502);
   });
+});
+
+// Fetch and report how the exchange ended: { status, bytes,
+// complete, timedOut }. Used for the mid-body failure below, where
+// the response starts normally and is then cut short.
+function getObserveEnd(port, p, ms = 3000) {
+  return new Promise((resolve) => {
+    let done = false;
+    let status = null;
+    let bytes = 0;
+    const finish = (v) => {
+      if (!done) {
+        done = true;
+        resolve({ status, bytes, ...v });
+      }
+    };
+    const req = http.get({ host: '127.0.0.1', port, path: p }, (res) => {
+      status = res.statusCode;
+      res.on('data', (c) => {
+        bytes += c.length;
+      });
+      res.on('end', () => finish({ complete: res.complete, timedOut: false }));
+      res.on('aborted', () =>
+        finish({ complete: res.complete, timedOut: false }),
+      );
+      res.on('close', () =>
+        finish({ complete: res.complete, timedOut: false }),
+      );
+    });
+    req.on('error', () => finish({ complete: false, timedOut: false }));
+    req.setTimeout(ms, () => {
+      req.destroy();
+      finish({ complete: false, timedOut: true });
+    });
+  });
+}
+
+test('500 on a later chunk cuts the response short instead of hanging', async () => {
+  // The payload is one chunk plus a little more, so the first chunk
+  // is streamed to the client and the failure only happens in
+  // streamRest, after the 200 status and the first bytes are out.
+  // No error status can be sent then; koed must cut the response so
+  // the client sees it end (incomplete) right away, not hang.
+  const bigSize = CHUNK_SIZE + 1024;
+  const big = makeData(bigSize);
+  const up = http.createServer((req, res) => {
+    const m = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
+    if (!m) {
+      res.writeHead(416);
+      res.end();
+      return;
+    }
+    const s = Number(m[1]);
+    const e = Number(m[2]);
+    if (s >= CHUNK_SIZE) {
+      res.writeHead(500);
+      res.end();
+      return;
+    }
+    res.writeHead(206, {
+      'Content-Type': 'audio/mp4',
+      'Content-Range': `bytes ${s}-${e}/${bigSize}`,
+      'Content-Length': e - s + 1,
+    });
+    res.end(big.subarray(s, e + 1));
+  });
+  const upPort2 = await listen(up);
+  writeCache(cacheFile, {
+    [VIDEO_ID]: { url: `http://127.0.0.1:${upPort2}/big`, ts: nowSec() },
+  });
+  const p = createServer({
+    host: '127.0.0.1',
+    port: 0,
+    token: TOKEN,
+    tokenFile: path.join(tmp, 'token'),
+    batchCacheFile: cacheFile,
+  });
+  const port = await listen(p);
+  try {
+    const r = await getObserveEnd(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.timedOut, false, 'koed must end the response, not hang');
+    assert.equal(r.status, 200);
+    assert.equal(r.bytes, CHUNK_SIZE, 'only the first chunk was delivered');
+    assert.equal(r.complete, false, 'the body ends incomplete');
+  } finally {
+    await close(p);
+    await close(up);
+  }
 });
 
 test('upstream connection refused gives 404', async () => {
