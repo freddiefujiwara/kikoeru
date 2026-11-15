@@ -1,101 +1,54 @@
 'use strict';
 
+// Core behaviour: routing, token / video-id checks, full and ranged
+// relaying against a fake upstream. The upstream payload is ~9.4 MB so
+// a full GET has to be split into several <= 4 MiB ranged chunks.
+
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
-const http = require('node:http');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 
 const { createServer, CHUNK_SIZE } = require('../src/server');
+const {
+  listen,
+  close,
+  request,
+  get,
+  makeData,
+  tmpDir,
+  writeCache,
+  nowSec,
+  makeMediaUpstream,
+  parseRangeHeader,
+} = require('./helpers');
 
 const TOKEN = '0123456789abcdef0123456789abcdef';
 const VIDEO_ID = 'htzMcSM6Ft0';
-const UNKNOWN_ID = 'dQw4w9WgXcQ'; // well-formed, but never in the test cache
+const SECOND_ID = 'dQw4w9WgXcQ'; // also present in the test cache
+const UNKNOWN_ID = 'AAAAAAAAAAA'; // well-formed, but never in the cache
 
-// Deterministic upstream payload (~9.4 MB, forces several chunks).
 const SIZE = 9 * 1024 * 1024 + 123;
-const data = Buffer.alloc(SIZE);
-for (let i = 0; i < SIZE; i++) data[i] = i % 251;
+const data = makeData(SIZE);
 
 let upstream;
+let upState;
 let proxy;
+let proxyPort;
 let tmp;
-let mediaRanges; // Range headers seen by /media
-let plainMediaGets; // requests to /media without a Range header
-
-function listen(server) {
-  return new Promise((resolve) =>
-    server.listen(0, '127.0.0.1', () => resolve(server.address().port)),
-  );
-}
-
-function get(port, p, headers = {}) {
-  return new Promise((resolve, reject) => {
-    http
-      .get({ host: '127.0.0.1', port, path: p, headers }, (res) => {
-        const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () =>
-          resolve({
-            status: res.statusCode,
-            headers: res.headers,
-            body: Buffer.concat(chunks),
-          }),
-        );
-      })
-      .on('error', reject);
-  });
-}
 
 before(async () => {
-  mediaRanges = [];
-  plainMediaGets = 0;
-  upstream = http.createServer((req, res) => {
-    if (req.url === '/redir') {
-      res.writeHead(302, { Location: '/media' });
-      res.end();
-      return;
-    }
-    if (req.url !== '/media') {
-      res.writeHead(404);
-      res.end();
-      return;
-    }
-    const range = req.headers.range;
-    if (!range) {
-      plainMediaGets++;
-      res.writeHead(200, {
-        'Content-Type': 'audio/mp4',
-        'Content-Length': SIZE,
-      });
-      res.end(data);
-      return;
-    }
-    mediaRanges.push(range);
-    const m = /^bytes=(\d+)-(\d+)$/.exec(range);
-    const s = Number(m[1]);
-    const e = Number(m[2]);
-    res.writeHead(206, {
-      'Content-Type': 'audio/mp4',
-      'Content-Range': `bytes ${s}-${e}/${SIZE}`,
-      'Content-Length': e - s + 1,
-    });
-    res.end(data.subarray(s, e + 1));
-  });
+  const up = makeMediaUpstream(data);
+  upstream = up.server;
+  upState = up.state;
   const upPort = await listen(upstream);
 
-  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'otod-test-'));
+  tmp = tmpDir();
   const batchCache = path.join(tmp, 'cache.json');
-  fs.writeFileSync(
-    batchCache,
-    JSON.stringify({
-      [VIDEO_ID]: {
-        url: `http://127.0.0.1:${upPort}/redir`,
-        ts: Math.floor(Date.now() / 1000),
-      },
-    }),
-  );
+  writeCache(batchCache, {
+    [VIDEO_ID]: { url: `http://127.0.0.1:${upPort}/redir`, ts: nowSec() },
+    [SECOND_ID]: { url: `http://127.0.0.1:${upPort}/media`, ts: nowSec() },
+  });
   proxy = createServer({
     host: '127.0.0.1',
     port: 0,
@@ -106,12 +59,20 @@ before(async () => {
   proxyPort = await listen(proxy);
 });
 
-let proxyPort;
-
-after(() => {
-  proxy.close();
-  upstream.close();
+after(async () => {
+  await close(proxy);
+  await close(upstream);
   fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+// --- routing and access checks -------------------------------------------
+
+test('correct token and video id returns 200', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/${SECOND_ID}`, {
+    Range: 'bytes=0-99',
+  });
+  assert.equal(r.status, 206);
+  assert.deepEqual(r.body, data.subarray(0, 100));
 });
 
 test('wrong token gets 404', async () => {
@@ -122,33 +83,147 @@ test('wrong token gets 404', async () => {
   assert.equal(r.status, 404);
 });
 
+test('token of a different length gets 404', async () => {
+  const r = await get(proxyPort, `/abc/${VIDEO_ID}`);
+  assert.equal(r.status, 404);
+});
+
+test('root path gets 404', async () => {
+  const r = await get(proxyPort, '/');
+  assert.equal(r.status, 404);
+});
+
+test('token without a video id gets 404', async () => {
+  const r = await get(proxyPort, `/${TOKEN}`);
+  assert.equal(r.status, 404);
+});
+
 test('prefixed path gets 404', async () => {
   const r = await get(proxyPort, `/foo/${TOKEN}/${VIDEO_ID}`);
   assert.equal(r.status, 404);
 });
+
+test('old prefixed route shape gets 404', async () => {
+  const r = await get(proxyPort, `/yt-play/${TOKEN}/${VIDEO_ID}`);
+  assert.equal(r.status, 404);
+});
+
+test('extra path segment gets 404', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/${VIDEO_ID}/extra`);
+  assert.equal(r.status, 404);
+});
+
+test('trailing slash gets 404', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/${VIDEO_ID}/`);
+  assert.equal(r.status, 404);
+});
+
+test('query string gets 404 (the route must match exactly)', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/${VIDEO_ID}?x=1`);
+  assert.equal(r.status, 404);
+});
+
+test('POST to a valid path gets 404', async () => {
+  const r = await request(proxyPort, `/${TOKEN}/${VIDEO_ID}`, {
+    method: 'POST',
+  });
+  assert.equal(r.status, 404);
+});
+
+test('PUT to a valid path gets 404', async () => {
+  const r = await request(proxyPort, `/${TOKEN}/${VIDEO_ID}`, {
+    method: 'PUT',
+  });
+  assert.equal(r.status, 404);
+});
+
+// --- video id format ------------------------------------------------------
 
 test('malformed video id gets 404', async () => {
   const r = await get(proxyPort, `/${TOKEN}/too-short`);
   assert.equal(r.status, 404);
 });
 
+test('video id of 10 characters gets 404', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/htzMcSM6Ft`);
+  assert.equal(r.status, 404);
+});
+
+test('video id of 12 characters gets 404', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/htzMcSM6Ft00`);
+  assert.equal(r.status, 404);
+});
+
+test('video id with an illegal character gets 404', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/htzMcSM6F!0`);
+  assert.equal(r.status, 404);
+});
+
+test('video id with a dot gets 404', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/htzMcSM6F.0`);
+  assert.equal(r.status, 404);
+});
+
+test('video id with dash and underscore is accepted', async () => {
+  // SECOND_ID has neither, so use a dedicated id that is in the cache
+  // of a throwaway server.
+  const upPort = upstream.address().port;
+  const cache = path.join(tmp, 'cache-dash.json');
+  writeCache(cache, {
+    'a-b_cdefghi': {
+      url: `http://127.0.0.1:${upPort}/media`,
+      ts: nowSec(),
+    },
+  });
+  const p = createServer({
+    host: '127.0.0.1',
+    port: 0,
+    token: TOKEN,
+    tokenFile: path.join(tmp, 'token'),
+    batchCacheFile: cache,
+  });
+  const port = await listen(p);
+  try {
+    const r = await get(port, `/${TOKEN}/a-b_cdefghi`, {
+      Range: 'bytes=0-9',
+    });
+    assert.equal(r.status, 206);
+    assert.deepEqual(r.body, data.subarray(0, 10));
+  } finally {
+    await close(p);
+  }
+});
+
+// --- full and ranged relaying ---------------------------------------------
+
 test('full GET streams the whole body via <=4MiB ranged chunks', async () => {
-  mediaRanges = [];
-  plainMediaGets = 0;
+  upState.requests = [];
+  upState.plainGets = 0;
   const r = await get(proxyPort, `/${TOKEN}/${VIDEO_ID}`);
   assert.equal(r.status, 200);
   assert.equal(r.headers['content-type'], 'audio/mp4');
   assert.equal(Number(r.headers['content-length']), SIZE);
+  assert.equal(r.headers['accept-ranges'], 'bytes');
   assert.deepEqual(r.body, data);
-  assert.equal(plainMediaGets, 0, 'upstream must never see a plain GET');
-  assert.ok(mediaRanges.length >= 3, 'expected several chunk requests');
-  for (const range of mediaRanges) {
-    const m = /^bytes=(\d+)-(\d+)$/.exec(range);
+  assert.equal(upState.plainGets, 0, 'upstream must never see a plain GET');
+  const ranges = upState.requests
+    .filter((q) => q.url === '/media')
+    .map((q) => q.range);
+  assert.ok(ranges.length >= 3, 'expected several chunk requests');
+  for (const range of ranges) {
+    const se = parseRangeHeader(range);
+    assert.ok(se, `unexpected range header: ${range}`);
     assert.ok(
-      Number(m[2]) - Number(m[1]) + 1 <= CHUNK_SIZE,
+      se[1] - se[0] + 1 <= CHUNK_SIZE,
       `chunk too large: ${range}`,
     );
   }
+});
+
+test('a second cached video id is relayed too', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/${SECOND_ID}`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, data);
 });
 
 test('range GET returns 206 with the exact byte slice', async () => {
@@ -156,10 +231,8 @@ test('range GET returns 206 with the exact byte slice', async () => {
     Range: 'bytes=1000000-1999999',
   });
   assert.equal(r.status, 206);
-  assert.equal(
-    r.headers['content-range'],
-    `bytes 1000000-1999999/${SIZE}`,
-  );
+  assert.equal(r.headers['content-range'], `bytes 1000000-1999999/${SIZE}`);
+  assert.equal(Number(r.headers['content-length']), 1000000);
   assert.deepEqual(r.body, data.subarray(1000000, 2000000));
 });
 
@@ -168,6 +241,10 @@ test('suffix range returns the tail', async () => {
     Range: 'bytes=-1000',
   });
   assert.equal(r.status, 206);
+  assert.equal(
+    r.headers['content-range'],
+    `bytes ${SIZE - 1000}-${SIZE - 1}/${SIZE}`,
+  );
   assert.deepEqual(r.body, data.subarray(SIZE - 1000));
 });
 
@@ -176,7 +253,20 @@ test('open-ended range works', async () => {
     Range: `bytes=${SIZE - 10}-`,
   });
   assert.equal(r.status, 206);
+  assert.equal(
+    r.headers['content-range'],
+    `bytes ${SIZE - 10}-${SIZE - 1}/${SIZE}`,
+  );
   assert.deepEqual(r.body, data.subarray(SIZE - 10));
+});
+
+test('single byte range returns exactly one byte', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/${VIDEO_ID}`, {
+    Range: 'bytes=0-0',
+  });
+  assert.equal(r.status, 206);
+  assert.equal(r.headers['content-range'], `bytes 0-0/${SIZE}`);
+  assert.deepEqual(r.body, data.subarray(0, 1));
 });
 
 test('unsatisfiable range returns 416', async () => {
@@ -187,73 +277,57 @@ test('unsatisfiable range returns 416', async () => {
   assert.equal(r.headers['content-range'], `bytes */${SIZE}`);
 });
 
+test('HEAD returns headers and no body', async () => {
+  const r = await request(proxyPort, `/${TOKEN}/${VIDEO_ID}`, {
+    method: 'HEAD',
+  });
+  assert.equal(r.status, 200);
+  assert.equal(Number(r.headers['content-length']), SIZE);
+  assert.equal(r.headers['content-type'], 'audio/mp4');
+  assert.equal(r.body.length, 0);
+});
+
+test('HEAD with a range returns 206 headers and no body', async () => {
+  const r = await request(proxyPort, `/${TOKEN}/${VIDEO_ID}`, {
+    method: 'HEAD',
+    headers: { Range: 'bytes=10-19' },
+  });
+  assert.equal(r.status, 206);
+  assert.equal(r.headers['content-range'], `bytes 10-19/${SIZE}`);
+  assert.equal(Number(r.headers['content-length']), 10);
+  assert.equal(r.body.length, 0);
+});
+
+test('If-Range is ignored and the range is served', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/${VIDEO_ID}`, {
+    Range: 'bytes=0-99',
+    'If-Range': '"some-other-etag"',
+  });
+  assert.equal(r.status, 206);
+  assert.deepEqual(r.body, data.subarray(0, 100));
+});
+
+test('an unparseable Range header falls back to the full body', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/${VIDEO_ID}`, {
+    Range: 'bytes=banana',
+  });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, data);
+});
+
+test('a multi-range header falls back to the full body', async () => {
+  const r = await get(proxyPort, `/${TOKEN}/${VIDEO_ID}`, {
+    Range: 'bytes=0-1,5-6',
+  });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, data);
+});
+
+// --- cache misses -----------------------------------------------------------
+
 test('video id missing from the batch cache gets 404', async () => {
   // The server never extracts URLs itself, so an id the shell pipeline
   // has not cached is a plain 404.
   const r = await get(proxyPort, `/${TOKEN}/${UNKNOWN_ID}`);
   assert.equal(r.status, 404);
-});
-
-test('stale batch cache entry gets 404', async () => {
-  const upPort = upstream.address().port;
-  const staleCache = path.join(tmp, 'cache-stale.json');
-  fs.writeFileSync(
-    staleCache,
-    JSON.stringify({
-      [VIDEO_ID]: {
-        url: `http://127.0.0.1:${upPort}/media`,
-        ts: Math.floor(Date.now() / 1000) - 6 * 3600, // older than 5 h
-      },
-    }),
-  );
-  const p2 = createServer({
-    host: '127.0.0.1',
-    port: 0,
-    token: TOKEN,
-    tokenFile: path.join(tmp, 'token'),
-    batchCacheFile: staleCache,
-  });
-  const port2 = await listen(p2);
-  try {
-    const r = await get(port2, `/${TOKEN}/${VIDEO_ID}`, {
-      Range: 'bytes=0-99',
-    });
-    assert.equal(r.status, 404);
-  } finally {
-    p2.close();
-  }
-});
-
-test('empty batch cache gets 404 for every video', async () => {
-  const emptyCache = path.join(tmp, 'cache-empty.json');
-  fs.writeFileSync(emptyCache, '{}');
-  const p3 = createServer({
-    host: '127.0.0.1',
-    port: 0,
-    token: TOKEN,
-    tokenFile: path.join(tmp, 'token'),
-    batchCacheFile: emptyCache,
-  });
-  const port3 = await listen(p3);
-  try {
-    const r = await get(port3, `/${TOKEN}/${VIDEO_ID}`);
-    assert.equal(r.status, 404);
-  } finally {
-    p3.close();
-  }
-});
-
-test('token file is generated with mode 600 when missing', async () => {
-  const tokenFile = path.join(tmp, 'subdir', 'token');
-  const p4 = createServer({
-    host: '127.0.0.1',
-    port: 0,
-    tokenFile,
-    batchCacheFile: path.join(tmp, 'cache.json'),
-  });
-  p4.close();
-  const st = fs.statSync(tokenFile);
-  assert.equal(st.mode & 0o777, 0o600);
-  const token = fs.readFileSync(tokenFile, 'utf8').trim();
-  assert.match(token, /^[0-9a-f]{32}$/);
 });

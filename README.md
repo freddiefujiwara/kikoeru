@@ -1,110 +1,212 @@
-# otod
+[![npm version](https://badge.fury.io/js/koed.svg)](https://badge.fury.io/js/koed)
 
-A streaming relay for YouTube audio. It exists because of a quirk of
-googlevideo stream URLs (the ones `yt-dlp -g -f bestaudio[ext=m4a]`
-returns):
+# koed
 
-- A plain sequential GET is throttled to roughly the playback bitrate
-  (~31 KB/s measured), so long videos take tens of seconds to start.
-- Ranged requests are answered at full speed (~10 MB/s measured), but a
-  single large range is throttled again.
-- Fetching in small ranged chunks (<= 4 MiB) stays fast end to end
-  (a 16.6 MB file in ~1.7 s measured).
+A small server that relays YouTube audio. It fetches the sound in
+small pieces and passes the pieces to the listener right away, so
+playback starts fast.
 
-`otod` sits between the client and googlevideo: it fetches the
-upstream stream in <= 4 MiB ranged chunks and forwards the bytes as they
-arrive. **Nothing is written to disk** — it is a relay, not a file host.
+## Why this exists
 
-Built for the [reader](https://github.com/freddiefujiwara/reader) web RSS
-reader, whose YouTube "podcast" playback uses these stream URLs.
+YouTube gives each video a special web address for its sound. Tools
+like `yt-dlp` can find this address. The address works, but it has a
+problem:
+
+- If a player asks for the sound in the normal way (from the start,
+  in order), YouTube sends the data very slowly — about as fast as
+  the sound plays (about 31 KB per second in our tests). A long
+  video can take 40 seconds before the first sound comes out.
+- If a player asks for a part of the file (a "range request"), YouTube
+  sends the data fast (about 10 MB per second in our tests). But if
+  the part is too big, YouTube slows down again.
+- Asking for small parts, one after another, stays fast to the end.
+  In our tests, a 16.6 MB file arrived in about 1.7 seconds this way.
+
+A phone browser cannot be told to fetch in small parts. So koed sits
+in the middle: the phone asks koed, and koed asks YouTube in small
+parts.
+
+## What koed does
+
+- It listens for requests of one form: `GET /<token>/<videoId>`.
+- It looks up the video's sound address in a cache file (see below).
+- It asks YouTube for the file in small parts of at most 4 MiB
+  (4,194,304 bytes) and sends each part to the listener as soon as
+  it arrives.
+- It saves nothing. No sound file is ever written to disk. koed is a
+  relay, not a file host.
+
+## What koed does not do
+
+Finding the sound address is **not** koed's job. A shell pipeline
+(`yt-audio` and `yt-audio-batch`, which run `yt-dlp`) finds the
+addresses and writes them to a cache file:
+
+```text
+~/.yt-audio/cache.json
+```
+
+koed only reads this file. For each video, the file holds the sound
+address and the time it was found:
+
+```json
+{
+  "htzMcSM6Ft0": {
+    "url": "https://...googlevideo.com/...",
+    "ts": 1763200000
+  }
+}
+```
+
+The rules are simple:
+
+- Entry exists and is less than 5 hours old → koed relays the sound.
+- Entry is missing or older than 5 hours → koed answers 404.
+  (The shell pipeline will find a fresh address on its next run.)
+
+Sound addresses stop working after some hours. If YouTube answers
+403 ("forbidden") while koed is working, koed reads the cache file
+one more time — the shell pipeline may have put a fresh address in
+it — and tries once more. If it still fails, koed answers 404.
+
+Built for the [reader](https://github.com/freddiefujiwara/reader)
+web RSS reader, which plays YouTube videos like podcasts.
+
+## Requirements
+
+- Node.js 18 or later
+- No extra packages. koed uses only the Node.js standard library.
+
+## Installation
+
+From npm:
+
+```bash
+npm i -g koed
+```
+
+Or from a tarball built from this repository:
+
+```bash
+npm pack                      # makes koed-0.1.0.tgz
+npm i -g ./koed-0.1.0.tgz
+```
+
+With mise's Node on our home server, the global install goes to the
+Node directory itself, so the module lands in
+`~/.local/share/mise/installs/node/<version>/lib/node_modules/koed`
+and the `koed` command in the `bin/` folder next to it.
 
 ## Usage
 
+```bash
+koed
 ```
+
+This starts the server on `127.0.0.1:8791`. It only listens on the
+local machine. To let others reach it, put a reverse proxy in front
+of it (see "Reverse proxy" below).
+
+### The request form
+
+```text
 GET /<token>/<videoId>
 ```
 
-The server is published at the root of its own host:
-`https://y.ze.gs/<token>/<videoId>`.
+- `token` — a shared secret word. It is part of the address, like a
+  password in the link. A wrong token gets a 404 answer.
+- `videoId` — the 11-character YouTube video id (letters, numbers,
+  `-` and `_`). Anything else gets a 404 answer.
 
-- `token` — a shared secret (see below). Wrong token: 404.
-- `videoId` — an 11-character YouTube video id. Anything else: 404.
+Every other address also gets a 404 answer: the top page `/`,
+addresses with extra parts, and so on. Only GET and HEAD requests
+are answered.
 
-Clients may send a single `Range` header (`bytes=a-b`, `bytes=a-`,
-`bytes=-n`); the server answers 206 with the exact byte slice, fetched
-from upstream in <= 4 MiB sub-ranges. Without a Range header it answers
-200 and streams the whole file the same way. `If-Range` is ignored.
+### Ranges
 
-### Stream URL resolution
+Players may ask for one part of the file with a `Range` header:
 
-Extracting stream URLs is **not** this server's job — that belongs to
-the shell pipeline (yt-audio / yt-audio-batch, which runs yt-dlp). This
-server only reads the pipeline's cache (`~/.yt-audio/cache.json`,
-read-only):
+```text
+Range: bytes=1000000-1999999
+Range: bytes=1000000-
+Range: bytes=-1000
+```
 
-- entry present and younger than 5 hours → relay that URL;
-- entry missing or stale → **404** (the shell refreshes it on its
-  cycle).
+koed answers `206` with exactly those bytes and a `Content-Range`
+header. The parts are still fetched from YouTube in pieces of at
+most 4 MiB. If the part cannot be given (for example, it starts
+after the end of the file), koed answers `416`. A `Range` header
+that koed cannot read is ignored, and the whole file is sent.
+`If-Range` is ignored.
 
-If the upstream answers 403 (URL expired server-side), the server
-re-reads the batch cache once — the shell may have refreshed it in the
-meantime — and retries; if that still fails, the answer is 404.
+## The token
 
-### Token
+The token lives in a file:
 
-The token lives in `~/.config/otod/token` (mode 600). If the file
-does not exist, the server generates a random 32-hex-digit token on
-first start and saves it there.
+```text
+~/.config/koed/token
+```
+
+- If the file exists, koed reads the token from it.
+- If the file does not exist, koed makes a random token (32 hex
+  digits) on the first start, saves it to the file with permission
+  `600` (only the owner can read it), and uses it from then on.
+- You can also set the token with the `KOED_TOKEN` environment
+  variable (see below). Then the file is not used.
+
+Anyone who knows the token and a video id can listen through your
+server, so keep the token secret.
 
 ## Configuration
 
-All settings have defaults matching the home-server layout; each can be
-overridden by an environment variable.
+Every setting has a default. Each one can be changed with an
+environment variable.
 
-| Variable | Default |
-| --- | --- |
-| `OTOD_HOST` | `127.0.0.1` |
-| `OTOD_PORT` | `8791` |
-| `OTOD_TOKEN` | (contents of the token file) |
-| `OTOD_TOKEN_FILE` | `~/.config/otod/token` |
-| `YT_AUDIO_CACHE` | `~/.yt-audio/cache.json` |
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `KOED_HOST` | `127.0.0.1` | Address to listen on |
+| `KOED_PORT` | `8791` | Port to listen on |
+| `KOED_TOKEN` | (contents of the token file) | The shared secret |
+| `KOED_TOKEN_FILE` | `~/.config/koed/token` | Where the token is kept |
+| `YT_AUDIO_CACHE` | `~/.yt-audio/cache.json` | The shell pipeline's cache file |
 
-No external dependencies — Node.js standard library only (Node >= 18).
+## Example
 
-## Run
+Start the server, read the token, and ask for a video:
 
-```sh
-npm install -g otod   # once published; see below for tarball installs
-otod
+```bash
+koed &
+TOKEN=$(cat ~/.config/koed/token)
+curl -o sound.m4a "http://127.0.0.1:8791/$TOKEN/htzMcSM6Ft0"
 ```
 
-## Install from a tarball (current method)
+Ask for only the first 100 bytes:
 
-npm publishing is not set up yet (it needs an `NPM_TOKEN` for this
-repository). Until then, install from a packed tarball:
-
-```sh
-npm pack
-npm install -g ./otod-0.1.0.tgz
+```bash
+curl -H 'Range: bytes=0-99' "http://127.0.0.1:8791/$TOKEN/htzMcSM6Ft0"
+# -> 206, Content-Range: bytes 0-99/<full size>, 100 bytes of sound
 ```
 
-With mise's Node 24 on the home server, the global prefix is the Node
-installation directory, so the module lands in
-`~/.local/share/mise/installs/node/<version>/lib/node_modules/otod`
-and the `otod` command in the sibling `bin/`.
+A video that is not in the cache, or a wrong token:
 
-## systemd user service
+```bash
+curl -i "http://127.0.0.1:8791/wrong-token/htzMcSM6Ft0"
+# -> 404 Not Found
+```
 
-`~/.config/systemd/user/otod.service`:
+## Run it as a service (systemd)
+
+On our home server, koed runs as a systemd user service. The unit
+file is `~/.config/systemd/user/koed.service`:
 
 ```ini
 [Unit]
-Description=otod (YouTube audio streaming relay)
+Description=koed (YouTube audio streaming relay)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/home/fumikazu/.local/share/mise/installs/node/24.14.1/bin/node /home/fumikazu/.local/share/mise/installs/node/24.14.1/lib/node_modules/otod/bin/otod.js
+ExecStart=/home/fumikazu/.local/share/mise/installs/node/24.14.1/bin/node /home/fumikazu/.local/share/mise/installs/node/24.14.1/lib/node_modules/koed/bin/koed.js
 Restart=on-failure
 RestartSec=3
 
@@ -112,24 +214,73 @@ RestartSec=3
 WantedBy=default.target
 ```
 
-```sh
+Change the Node version in the paths when Node is upgraded. Then:
+
+```bash
 systemctl --user daemon-reload
-systemctl --user enable --now otod
+systemctl --user enable --now koed
 ```
 
-(Adjust the Node version in the paths when Node is upgraded. User
-lingering is already enabled on the server, so the service starts at
-boot.)
+If user lingering is on (`loginctl enable-linger`), the service
+starts at boot and keeps running after logout.
 
 ## Reverse proxy
 
-The server only listens on localhost. On the home server, nginx
-publishes it as its own virtual host, `https://y.ze.gs/`, proxying the
-whole site to `127.0.0.1:8791`; the setup notes live with the
-server-side documentation.
+koed only listens on the local machine, so we publish it with nginx
+on its own host name. In this example the host is `y.ze.gs` and the
+whole site is passed to koed:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name y.ze.gs;
+
+    ssl_certificate     /etc/letsencrypt/live/ze.gs/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ze.gs/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8791;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Range $http_range;
+        proxy_set_header If-Range $http_if_range;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 600s;
+    }
+}
+```
+
+Then a listener uses `https://y.ze.gs/<token>/<videoId>`. Notes:
+
+- `proxy_buffering off` matters: the sound must flow to the listener
+  as it arrives, not after nginx has collected a big part of it.
+- The token is the only lock. There is no login page.
 
 ## Development
 
-```sh
-npm test   # node:test, spins up a fake upstream; no network needed
+Run the tests:
+
+```bash
+npm test
 ```
+
+The tests use the Node.js test runner. They start a fake YouTube
+server on the local machine, so no network is needed. They cover:
+
+- the request form: right and wrong tokens, video id rules, wrong
+  paths, request methods;
+- the cache rules: fresh, old, missing and broken cache files;
+- ranges: all three forms, ends past the file size, parts that
+  cannot be given (416);
+- the small-parts fetching: every request to the fake YouTube is
+  recorded and checked to be at most 4 MiB, in order, and complete;
+- errors from YouTube: 403 and the one retry with a fresh cache,
+  500 answers, and refused connections;
+- the token file: how it is made, its permission, and reuse after
+  a restart;
+- the environment variables for all settings.
+
+## Contributing
+
+Bug reports and pull requests are welcome on GitHub at https://github.com/freddiefujiwara/koed
