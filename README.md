@@ -1,6 +1,6 @@
-[![npm version](https://badge.fury.io/js/koed.svg)](https://badge.fury.io/js/koed)
+[![npm version](https://badge.fury.io/js/kikoeru.svg)](https://badge.fury.io/js/kikoeru)
 
-# koed
+# kikoeru
 
 A small server that relays YouTube audio. It fetches the sound in
 small pieces and passes the pieces to the listener right away, so
@@ -22,23 +22,23 @@ problem:
 - Asking for small parts, one after another, stays fast to the end.
   In our tests, a 16.6 MB file arrived in about 1.7 seconds this way.
 
-A phone browser cannot be told to fetch in small parts. So koed sits
-in the middle: the phone asks koed, and koed asks YouTube in small
+A phone browser cannot be told to fetch in small parts. So kikoeru sits
+in the middle: the phone asks kikoeru, and kikoeru asks YouTube in small
 parts.
 
-## What koed does
+## What kikoeru does
 
 - It listens for requests of one form: `GET /<token>/<videoId>`.
 - It looks up the video's sound address in a cache file (see below).
 - It asks YouTube for the file in small parts of at most 4 MiB
   (4,194,304 bytes) and sends each part to the listener as soon as
   it arrives.
-- It saves nothing. No sound file is ever written to disk. koed is a
+- It saves nothing. No sound file is ever written to disk. kikoeru is a
   relay, not a file host.
 
-## What koed does not do
+## What kikoeru does not do
 
-Finding the sound address is **not** koed's job. A shell pipeline
+Finding the sound address is **not** kikoeru's job. A shell pipeline
 (`yt-audio` and `yt-audio-batch`, which run `yt-dlp`) finds the
 addresses and writes them to a cache file:
 
@@ -46,7 +46,7 @@ addresses and writes them to a cache file:
 ~/.yt-audio/cache.json
 ```
 
-koed only reads this file. For each video, the file holds the sound
+kikoeru only reads this file. For each video, the file holds the sound
 address and the time it was found:
 
 ```json
@@ -60,20 +60,20 @@ address and the time it was found:
 
 The rules are simple:
 
-- Entry exists and is less than 5 hours old → koed relays the sound.
-- Entry is missing or older than 5 hours → koed answers 404.
+- Entry exists and is less than 5 hours old → kikoeru relays the sound.
+- Entry is missing or older than 5 hours → kikoeru answers 404.
   (The shell pipeline will find a fresh address on its next run.)
 
 Sound addresses stop working after some hours. If YouTube answers
-403 ("forbidden") while koed is working, koed reads the cache file
+403 ("forbidden") while kikoeru is working, kikoeru reads the cache file
 one more time — the shell pipeline may have put a fresh address in
-it — and tries once more. If the address still does not work, koed
+it — and tries once more. If the address still does not work, kikoeru
 answers 404.
 
-If YouTube fails while the sound is being sent, koed never leaves
-the listener waiting. When no sound has been sent yet, koed answers
+If YouTube fails while the sound is being sent, kikoeru never leaves
+the listener waiting. When no sound has been sent yet, kikoeru answers
 502 ("bad gateway") at once. When some sound has already been sent,
-koed ends the connection at once, so the player can show an error
+kikoeru ends the connection at once, so the player can show an error
 instead of waiting for ever.
 
 Built for the [reader](https://github.com/freddiefujiwara/reader)
@@ -82,32 +82,32 @@ web RSS reader, which plays YouTube videos like podcasts.
 ## Requirements
 
 - Node.js 18 or later
-- No extra packages. koed uses only the Node.js standard library.
+- No extra packages. kikoeru uses only the Node.js standard library.
 
 ## Installation
 
 From npm:
 
 ```bash
-npm i -g koed
+npm i -g kikoeru
 ```
 
 Or from a tarball built from this repository:
 
 ```bash
-npm pack                      # makes koed-0.1.0.tgz
-npm i -g ./koed-0.1.0.tgz
+npm pack                      # makes kikoeru-0.1.2.tgz
+npm i -g ./kikoeru-0.1.2.tgz
 ```
 
 With mise's Node on our home server, the global install goes to the
 Node directory itself, so the module lands in
-`~/.local/share/mise/installs/node/<version>/lib/node_modules/koed`
-and the `koed` command in the `bin/` folder next to it.
+`~/.local/share/mise/installs/node/<version>/lib/node_modules/kikoeru`
+and the `kikoeru` command in the `bin/` folder next to it.
 
 ## Usage
 
 ```bash
-koed
+kikoeru
 ```
 
 This starts the server on `127.0.0.1:8791`. It only listens on the
@@ -139,11 +139,11 @@ Range: bytes=1000000-
 Range: bytes=-1000
 ```
 
-koed answers `206` with exactly those bytes and a `Content-Range`
+kikoeru answers `206` with exactly those bytes and a `Content-Range`
 header. The parts are still fetched from YouTube in pieces of at
 most 4 MiB. If the part cannot be given (for example, it starts
-after the end of the file), koed answers `416`. A `Range` header
-that koed cannot read is ignored, and the whole file is sent.
+after the end of the file), kikoeru answers `416`. A `Range` header
+that kikoeru cannot read is ignored, and the whole file is sent.
 `If-Range` is ignored.
 
 ## The token
@@ -151,14 +151,14 @@ that koed cannot read is ignored, and the whole file is sent.
 The token lives in a file:
 
 ```text
-~/.config/koed/token
+~/.config/kikoeru/token
 ```
 
-- If the file exists, koed reads the token from it.
-- If the file does not exist, koed makes a random token (32 hex
+- If the file exists, kikoeru reads the token from it.
+- If the file does not exist, kikoeru makes a random token (32 hex
   digits) on the first start, saves it to the file with permission
   `600` (only the owner can read it), and uses it from then on.
-- You can also set the token with the `KOED_TOKEN` environment
+- You can also set the token with the `KIKOERU_TOKEN` environment
   variable (see below). Then the file is not used.
 
 Anyone who knows the token and a video id can listen through your
@@ -171,10 +171,10 @@ environment variable.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `KOED_HOST` | `127.0.0.1` | Address to listen on |
-| `KOED_PORT` | `8791` | Port to listen on |
-| `KOED_TOKEN` | (contents of the token file) | The shared secret |
-| `KOED_TOKEN_FILE` | `~/.config/koed/token` | Where the token is kept |
+| `KIKOERU_HOST` | `127.0.0.1` | Address to listen on |
+| `KIKOERU_PORT` | `8791` | Port to listen on |
+| `KIKOERU_TOKEN` | (contents of the token file) | The shared secret |
+| `KIKOERU_TOKEN_FILE` | `~/.config/kikoeru/token` | Where the token is kept |
 | `YT_AUDIO_CACHE` | `~/.yt-audio/cache.json` | The shell pipeline's cache file |
 
 ## Example
@@ -182,8 +182,8 @@ environment variable.
 Start the server, read the token, and ask for a video:
 
 ```bash
-koed &
-TOKEN=$(cat ~/.config/koed/token)
+kikoeru &
+TOKEN=$(cat ~/.config/kikoeru/token)
 curl -o sound.m4a "http://127.0.0.1:8791/$TOKEN/htzMcSM6Ft0"
 ```
 
@@ -203,17 +203,17 @@ curl -i "http://127.0.0.1:8791/wrong-token/htzMcSM6Ft0"
 
 ## Run it as a service (systemd)
 
-On our home server, koed runs as a systemd user service. The unit
-file is `~/.config/systemd/user/koed.service`:
+On our home server, kikoeru runs as a systemd user service. The unit
+file is `~/.config/systemd/user/kikoeru.service`:
 
 ```ini
 [Unit]
-Description=koed (YouTube audio streaming relay)
+Description=kikoeru (YouTube audio streaming relay)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/home/fumikazu/.local/share/mise/installs/node/24.14.1/bin/node /home/fumikazu/.local/share/mise/installs/node/24.14.1/lib/node_modules/koed/bin/koed.js
+ExecStart=/home/fumikazu/.local/share/mise/installs/node/24.14.1/bin/node /home/fumikazu/.local/share/mise/installs/node/24.14.1/lib/node_modules/kikoeru/bin/kikoeru.js
 Restart=on-failure
 RestartSec=3
 
@@ -225,7 +225,7 @@ Change the Node version in the paths when Node is upgraded. Then:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now koed
+systemctl --user enable --now kikoeru
 ```
 
 If user lingering is on (`loginctl enable-linger`), the service
@@ -233,9 +233,9 @@ starts at boot and keeps running after logout.
 
 ## Reverse proxy
 
-koed only listens on the local machine, so we publish it with nginx
+kikoeru only listens on the local machine, so we publish it with nginx
 on its own host name. In this example the host is `y.ze.gs` and the
-whole site is passed to koed:
+whole site is passed to kikoeru:
 
 ```nginx
 server {
@@ -290,4 +290,4 @@ server on the local machine, so no network is needed. They cover:
 
 ## Contributing
 
-Bug reports and pull requests are welcome on GitHub at https://github.com/freddiefujiwara/koed
+Bug reports and pull requests are welcome on GitHub at https://github.com/freddiefujiwara/kikoeru

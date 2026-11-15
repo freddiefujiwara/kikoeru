@@ -43,7 +43,7 @@ after(async () => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-// Start a throwaway koed whose batch cache is `cacheFile`, run `fn`
+// Start a throwaway kikoeru whose batch cache is `cacheFile`, run `fn`
 // against its port, and always close it.
 async function withServer(cacheFile, fn) {
   const p = createServer({

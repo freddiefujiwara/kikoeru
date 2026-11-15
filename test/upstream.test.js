@@ -34,7 +34,7 @@ let upstream;
 let upPort;
 let tmp;
 let hits; // per-path request counts
-let cacheFile; // the batch cache the running koed reads
+let cacheFile; // the batch cache the running kikoeru reads
 let onFlakyChunk; // hook fired when /flaky gets a data (non-probe) request
 
 function serveRange(req, res) {
@@ -121,7 +121,7 @@ after(async () => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-// Start an koed whose cache points VIDEO_ID at `upstreamPath`.
+// Start an kikoeru whose cache points VIDEO_ID at `upstreamPath`.
 async function withServerAt(upstreamPath, fn) {
   writeCache(cacheFile, {
     [VIDEO_ID]: {
@@ -188,14 +188,14 @@ test('403 on the first data chunk retries with the refreshed cache URL', async (
 
 test('403 on a data chunk with no cache refresh gives a prompt 502', async () => {
   // The retry re-reads the same dead URL and fails again. Nothing
-  // has been sent to the client at that point, so koed must answer
+  // has been sent to the client at that point, so kikoeru must answer
   // promptly with 502 instead of leaving the request hanging.
   hits = {};
   onFlakyChunk = () => {};
   try {
     await withServerAt('/flaky', async (port) => {
       const r = await getExpectTimeout(port, `/${TOKEN}/${VIDEO_ID}`);
-      assert.equal(r.timedOut, false, 'koed must answer, not hang');
+      assert.equal(r.timedOut, false, 'kikoeru must answer, not hang');
       assert.equal(r.status, 502);
     });
   } finally {
@@ -215,7 +215,7 @@ test('500 on a data chunk gives a prompt 502', async () => {
   // is sent to the client, so it is answered with a prompt 502.
   await withServerAt('/chunk500', async (port) => {
     const r = await getExpectTimeout(port, `/${TOKEN}/${VIDEO_ID}`);
-    assert.equal(r.timedOut, false, 'koed must answer, not hang');
+    assert.equal(r.timedOut, false, 'kikoeru must answer, not hang');
     assert.equal(r.status, 502);
   });
 });
@@ -259,7 +259,7 @@ test('500 on a later chunk cuts the response short instead of hanging', async ()
   // The payload is one chunk plus a little more, so the first chunk
   // is streamed to the client and the failure only happens in
   // streamRest, after the 200 status and the first bytes are out.
-  // No error status can be sent then; koed must cut the response so
+  // No error status can be sent then; kikoeru must cut the response so
   // the client sees it end (incomplete) right away, not hang.
   const bigSize = CHUNK_SIZE + 1024;
   const big = makeData(bigSize);
@@ -298,7 +298,7 @@ test('500 on a later chunk cuts the response short instead of hanging', async ()
   const port = await listen(p);
   try {
     const r = await getObserveEnd(port, `/${TOKEN}/${VIDEO_ID}`);
-    assert.equal(r.timedOut, false, 'koed must end the response, not hang');
+    assert.equal(r.timedOut, false, 'kikoeru must end the response, not hang');
     assert.equal(r.status, 200);
     assert.equal(r.bytes, CHUNK_SIZE, 'only the first chunk was delivered');
     assert.equal(r.complete, false, 'the body ends incomplete');
