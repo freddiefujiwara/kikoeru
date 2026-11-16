@@ -25,6 +25,13 @@
  * is re-read once (the shell may have refreshed it in the meantime) and
  * the request is retried; if that still fails, the answer is 404.
  *
+ * Redirects are followed for every chunk request, not just the probe:
+ * googlevideo redirects data chunks too, and an unfollowed redirect
+ * used to cut the stream at that chunk boundary. A chunk that still
+ * fails partway through is resumed from the first byte the client is
+ * missing, after re-resolving the stream URL; only when the resume
+ * also fails is the response cut short.
+ *
  * A failure while streaming is always answered, never left hanging:
  * before the response is committed the client gets a 502, and once
  * bytes are flowing the response is cut short instead.
@@ -38,6 +45,7 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 
 const CHUNK_SIZE = 4 * 1024 * 1024; // upstream sub-range size
+const MAX_STREAM_RECOVERIES = 2; // consecutive resumes per chunk position
 const FALLBACK_FRESH_SEC = 6 * 3600; // no expire param: ts + 6 h decides
 const EXPIRY_MARGIN_SEC = 60; // stop serving this long before a URL expires
 const META_TTL_MS = 50 * 60 * 1000; // resolved size/type/final-URL cache
@@ -170,16 +178,17 @@ function expiredError() {
 }
 
 /**
- * Probe total size and content type with a 1-byte range request, following
- * redirects manually. Every upstream request carries a Range header:
- * automatic redirect handlers tend to drop it, and a plain GET would both
- * lose the range and hit the throttled path. Returns the final URL along
- * with the metadata.
+ * Open one ranged chunk, following redirects manually. Every upstream
+ * request carries a Range header: automatic redirect handlers tend to
+ * drop it, and a plain GET would both lose the range and hit the
+ * throttled path. The probe and the data chunks share this, because
+ * googlevideo redirects both. Returns the response together with the
+ * URL that finally answered, so later chunks can go straight there.
  */
-async function probeMeta(startUrl) {
+async function openChunk(startUrl, start, end) {
   let url = startUrl;
   for (let i = 0; i < 5; i++) {
-    const res = await openUpstream(url, { Range: 'bytes=0-0' });
+    const res = await openUpstream(url, { Range: `bytes=${start}-${end}` });
     const status = res.statusCode || 0;
     const location = res.headers.location;
     if (status >= 300 && status < 400 && location) {
@@ -193,16 +202,25 @@ async function probeMeta(startUrl) {
     }
     if (status !== 206) {
       res.destroy();
-      throw new Error(`unexpected probe status ${status}`);
+      throw new Error(`unexpected chunk status ${status}`);
     }
-    const cr = res.headers['content-range'] || '';
-    const m = /\/(\d+)\s*$/.exec(cr);
-    const contentType = res.headers['content-type'] || 'audio/x-m4a';
-    res.destroy();
-    if (!m) throw new Error(`no total size in Content-Range: ${cr}`);
-    return { finalUrl: url, size: Number(m[1]), contentType };
+    return { res, finalUrl: url };
   }
   throw new Error('too many redirects');
+}
+
+/**
+ * Probe total size and content type with a 1-byte range request.
+ * Returns the final URL along with the metadata.
+ */
+async function probeMeta(startUrl) {
+  const { res, finalUrl } = await openChunk(startUrl, 0, 0);
+  const cr = res.headers['content-range'] || '';
+  const m = /\/(\d+)\s*$/.exec(cr);
+  const contentType = res.headers['content-type'] || 'audio/x-m4a';
+  res.destroy();
+  if (!m) throw new Error(`no total size in Content-Range: ${cr}`);
+  return { finalUrl, size: Number(m[1]), contentType };
 }
 
 async function getMeta(cfg, state, videoId, force = false) {
@@ -312,41 +330,43 @@ async function handle(cfg, state, token, req, res) {
     // expired upstream URL can be retried once against a freshly
     // re-read batch cache.
     const tracker = { committed: false, wrote: false };
+    // Re-resolve the stream URL from the batch cache (the shell may
+    // have refreshed it) for a mid-stream resume; null when the cache
+    // has nothing usable.
+    const refresh = async () => {
+      state.meta.delete(videoId);
+      try {
+        const m = await getMeta(cfg, state, videoId, true);
+        return m ? m.finalUrl : null;
+      } catch {
+        return null;
+      }
+    };
     try {
       const firstEnd = Math.min(start + cfg.chunkSize - 1, end);
-      const up = await openUpstream(meta.finalUrl, {
-        Range: `bytes=${start}-${firstEnd}`,
-      });
-      const status = up.statusCode || 0;
-      if (status === 403) {
-        up.destroy();
-        throw expiredError();
-      }
-      if (status !== 206) {
-        up.destroy();
-        throw new Error(`unexpected chunk status ${status}`);
-      }
+      const first = await openChunk(meta.finalUrl, start, firstEnd);
       tracker.committed = true;
       res.writeHead(range ? 206 : 200, headers);
-      for await (const buf of up) {
-        if (res.destroyed || res.writableEnded) {
-          up.destroy();
-          return;
-        }
-        tracker.wrote = true;
-        if (!res.write(buf)) {
-          await new Promise((resolve) => res.once('drain', resolve));
-        }
+      const counter = { n: 0 };
+      let gone = false;
+      try {
+        gone = await writeBody(first.res, res, tracker, counter);
+      } catch {
+        // The first chunk died partway; streamRange below resumes
+        // from the first byte the client is missing.
       }
-      if (firstEnd < end) {
-        await streamRest(
-          meta.finalUrl,
-          firstEnd + 1,
+      if (gone || res.destroyed || res.writableEnded) return;
+      const restStart = start + counter.n;
+      if (restStart <= end) {
+        await streamRange({
+          url: first.finalUrl,
+          refresh,
+          start: restStart,
           end,
           res,
           tracker,
-          cfg.chunkSize,
-        );
+          chunkSize: cfg.chunkSize,
+        });
       }
       res.end();
       return;
@@ -376,34 +396,70 @@ async function handle(cfg, state, token, req, res) {
   }
 }
 
-async function streamRest(finalUrl, start, end, res, tracker, chunkSize) {
+/**
+ * Write an upstream body to the client, counting the bytes into
+ * counter.n. The count stays accurate even when the upstream dies
+ * partway and the iteration throws, so the caller knows exactly
+ * which byte to resume from. Returns true when the client went away
+ * mid-write and the caller should stop quietly.
+ */
+async function writeBody(up, res, tracker, counter) {
+  for await (const buf of up) {
+    if (res.destroyed || res.writableEnded) {
+      up.destroy();
+      return true;
+    }
+    tracker.wrote = true;
+    counter.n += buf.length;
+    if (!res.write(buf)) {
+      await new Promise((resolve) => res.once('drain', resolve));
+    }
+  }
+  return false;
+}
+
+/**
+ * Stream [start, end] in chunkSize pieces. A chunk that fails (an
+ * upstream error, or a body that ends short) is resumed from the
+ * first byte the client is missing: refresh() re-resolves the stream
+ * URL and the chunk is retried from that offset. After
+ * MAX_STREAM_RECOVERIES consecutive failures at the same position
+ * the error is thrown, and the caller cuts the response.
+ */
+async function streamRange({ url, refresh, start, end, res, tracker, chunkSize }) {
   let pos = start;
+  let current = url;
+  let recoveries = 0;
   while (pos <= end) {
     if (res.destroyed || res.writableEnded) return;
     const chunkEnd = Math.min(pos + chunkSize - 1, end);
-    const up = await openUpstream(finalUrl, {
-      Range: `bytes=${pos}-${chunkEnd}`,
-    });
-    const status = up.statusCode || 0;
-    if (status === 403) {
-      up.destroy();
-      throw expiredError();
-    }
-    if (status !== 206) {
-      up.destroy();
-      throw new Error(`unexpected chunk status ${status}`);
-    }
-    for await (const buf of up) {
-      if (res.destroyed || res.writableEnded) {
-        up.destroy();
-        return;
+    const counter = { n: 0 };
+    try {
+      const chunk = await openChunk(current, pos, chunkEnd);
+      current = chunk.finalUrl;
+      const gone = await writeBody(chunk.res, res, tracker, counter);
+      if (gone || res.destroyed || res.writableEnded) return;
+      if (counter.n !== chunkEnd - pos + 1) {
+        throw new Error(
+          `short chunk at ${pos}: got ${counter.n} of ${chunkEnd - pos + 1} bytes`,
+        );
       }
-      tracker.wrote = true;
-      if (!res.write(buf)) {
-        await new Promise((resolve) => res.once('drain', resolve));
+    } catch (e) {
+      pos += counter.n;
+      if (pos > chunkEnd) {
+        // The whole chunk arrived despite the error; move on.
+        recoveries = 0;
+        continue;
       }
+      if (recoveries >= MAX_STREAM_RECOVERIES) throw e;
+      const fresh = await refresh();
+      if (!fresh) throw e;
+      recoveries += 1;
+      current = fresh;
+      continue;
     }
     pos = chunkEnd + 1;
+    recoveries = 0;
   }
 }
 

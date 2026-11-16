@@ -93,6 +93,16 @@ before(async () => {
         res.writeHead(403);
         res.end();
         return;
+      case '/redirchunk':
+        // The probe is served, but data chunks are redirected to
+        // /good, the way googlevideo redirects chunk requests.
+        if (range === 'bytes=0-0') {
+          serveRange(req, res);
+          return;
+        }
+        res.writeHead(302, { Location: '/good' });
+        res.end();
+        return;
       case '/probe500':
         res.writeHead(500);
         res.end();
@@ -203,6 +213,18 @@ test('403 on a data chunk with no cache refresh gives a prompt 502', async () =>
   }
 });
 
+test('a 302 redirect on a data chunk is followed', async () => {
+  // googlevideo answers chunk requests with a redirect often enough
+  // that treating it as an error cut streams at the first chunk.
+  hits = {};
+  await withServerAt('/redirchunk', async (port) => {
+    const r = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, data);
+  });
+  assert.ok(hits['/good'] >= 1, 'the redirect target served the chunk');
+});
+
 test('500 on the probe gives 404', async () => {
   await withServerAt('/probe500', async (port) => {
     const r = await get(port, `/${TOKEN}/${VIDEO_ID}`);
@@ -258,7 +280,7 @@ function getObserveEnd(port, p, ms = 3000) {
 test('500 on a later chunk cuts the response short instead of hanging', async () => {
   // The payload is one chunk plus a little more, so the first chunk
   // is streamed to the client and the failure only happens in
-  // streamRest, after the 200 status and the first bytes are out.
+  // streamRange, after the 200 status and the first bytes are out.
   // No error status can be sent then; kikoeru must cut the response so
   // the client sees it end (incomplete) right away, not hang.
   const bigSize = CHUNK_SIZE + 1024;
@@ -306,6 +328,140 @@ test('500 on a later chunk cuts the response short instead of hanging', async ()
     await close(p);
     await close(up);
   }
+});
+
+// Start an kikoeru whose cache points VIDEO_ID at a path on a
+// one-off upstream server (for the >1 chunk payloads below).
+async function withBigServer(upstreamServer, upstreamPath, fn) {
+  const p2 = await listen(upstreamServer);
+  writeCache(cacheFile, {
+    [VIDEO_ID]: {
+      url: `http://127.0.0.1:${p2}${upstreamPath}`,
+      ts: nowSec(),
+    },
+  });
+  const p = createServer({
+    host: '127.0.0.1',
+    port: 0,
+    token: TOKEN,
+    tokenFile: path.join(tmp, 'token'),
+    batchCacheFile: cacheFile,
+  });
+  const port = await listen(p);
+  try {
+    await fn(port);
+  } finally {
+    await close(p);
+    await close(upstreamServer);
+  }
+}
+
+function serveBigRange(big, req, res) {
+  const m = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
+  if (!m) {
+    res.writeHead(416);
+    res.end();
+    return false;
+  }
+  const s = Number(m[1]);
+  const e = Number(m[2]);
+  res.writeHead(206, {
+    'Content-Type': 'audio/mp4',
+    'Content-Range': `bytes ${s}-${e}/${big.length}`,
+    'Content-Length': e - s + 1,
+  });
+  res.end(big.subarray(s, e + 1));
+  return true;
+}
+
+test('a 302 redirect on a later chunk is followed', async () => {
+  const big = makeData(CHUNK_SIZE + 1024);
+  const up = http.createServer((req, res) => {
+    const m = /^bytes=(\d+)-/.exec(req.headers.range || '');
+    const s = m ? Number(m[1]) : 0;
+    const pathname = (req.url || '').split('?')[0];
+    if (pathname === '/big' && s >= CHUNK_SIZE) {
+      res.writeHead(302, { Location: '/bigfinal' });
+      res.end();
+      return;
+    }
+    serveBigRange(big, req, res);
+  });
+  await withBigServer(up, '/big', async (port) => {
+    const r = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, big);
+  });
+});
+
+test('403 on a later chunk resumes with the refreshed cache URL', async () => {
+  // The first chunk streams fine, then the URL dies. The failure is
+  // mid-body, so no new response can be started: kikoeru re-resolves
+  // the stream URL (the hook below refreshes the batch cache, like
+  // the shell pipeline would) and resumes from the failed offset.
+  const big = makeData(CHUNK_SIZE + 1024);
+  let refreshed = false;
+  const up = http.createServer((req, res) => {
+    const m = /^bytes=(\d+)-/.exec(req.headers.range || '');
+    const s = m ? Number(m[1]) : 0;
+    const pathname = (req.url || '').split('?')[0];
+    if (pathname === '/late' && s >= CHUNK_SIZE) {
+      if (!refreshed) {
+        refreshed = true;
+        writeCache(cacheFile, {
+          [VIDEO_ID]: {
+            url: `http://127.0.0.1:${up.address().port}/lategood`,
+            ts: nowSec(),
+          },
+        });
+      }
+      res.writeHead(403);
+      res.end();
+      return;
+    }
+    serveBigRange(big, req, res);
+  });
+  await withBigServer(up, '/late', async (port) => {
+    const r = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, big);
+  });
+  assert.equal(refreshed, true, 'the dead chunk triggered a cache refresh');
+});
+
+test('a chunk connection that dies partway resumes from the missing byte', async () => {
+  // The second chunk's first attempt delivers half its bytes and
+  // then the socket dies. kikoeru must resume at exactly the first
+  // missing byte: the reassembled body is compared byte for byte.
+  const big = makeData(CHUNK_SIZE + 1024);
+  let dropped = false;
+  const up = http.createServer((req, res) => {
+    const m = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
+    if (!m) {
+      res.writeHead(416);
+      res.end();
+      return;
+    }
+    const s = Number(m[1]);
+    const e = Number(m[2]);
+    if (s >= CHUNK_SIZE && !dropped) {
+      dropped = true;
+      res.writeHead(206, {
+        'Content-Type': 'audio/mp4',
+        'Content-Range': `bytes ${s}-${e}/${big.length}`,
+        'Content-Length': e - s + 1,
+      });
+      res.write(big.subarray(s, s + 512), () => res.socket.destroy());
+      return;
+    }
+    serveBigRange(big, req, res);
+  });
+  await withBigServer(up, '/drops', async (port) => {
+    const r = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, big);
+  });
+  assert.equal(dropped, true, 'the drop really happened');
 });
 
 test('upstream connection refused gives 404', async () => {
