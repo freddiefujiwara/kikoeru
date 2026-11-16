@@ -103,6 +103,16 @@ before(async () => {
         res.writeHead(302, { Location: '/good' });
         res.end();
         return;
+      case '/loopredir':
+        // The probe is served, but data chunks redirect to
+        // themselves forever.
+        if (range === 'bytes=0-0') {
+          serveRange(req, res);
+          return;
+        }
+        res.writeHead(302, { Location: '/loopredir' });
+        res.end();
+        return;
       case '/probe500':
         res.writeHead(500);
         res.end();
@@ -223,6 +233,16 @@ test('a 302 redirect on a data chunk is followed', async () => {
     assert.deepEqual(r.body, data);
   });
   assert.ok(hits['/good'] >= 1, 'the redirect target served the chunk');
+});
+
+test('a redirect loop on a data chunk gives a prompt 502', async () => {
+  // Redirects are followed at most 5 times; a loop must surface as a
+  // prompt error before anything is sent to the client, not a hang.
+  await withServerAt('/loopredir', async (port) => {
+    const r = await getExpectTimeout(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.timedOut, false, 'kikoeru must answer, not hang');
+    assert.equal(r.status, 502);
+  });
 });
 
 test('500 on the probe gives 404', async () => {
@@ -462,6 +482,168 @@ test('a chunk connection that dies partway resumes from the missing byte', async
     assert.deepEqual(r.body, big);
   });
   assert.equal(dropped, true, 'the drop really happened');
+});
+
+test('the first chunk dying partway resumes from the missing byte', async () => {
+  // Same drop as the later-chunk case, but inside the very first
+  // chunk, whose body is written before streamRange takes over. The
+  // resume must still start at exactly the first missing byte.
+  const big = makeData(CHUNK_SIZE + 1024);
+  let dropped = false;
+  const up = http.createServer((req, res) => {
+    const range = req.headers.range || '';
+    const m = /^bytes=(\d+)-(\d+)$/.exec(range);
+    if (!m) {
+      res.writeHead(416);
+      res.end();
+      return;
+    }
+    const s = Number(m[1]);
+    const e = Number(m[2]);
+    if (s === 0 && e > 0 && !dropped) {
+      dropped = true;
+      res.writeHead(206, {
+        'Content-Type': 'audio/mp4',
+        'Content-Range': `bytes ${s}-${e}/${big.length}`,
+        'Content-Length': e - s + 1,
+      });
+      res.write(big.subarray(s, s + 512), () => res.socket.destroy());
+      return;
+    }
+    serveBigRange(big, req, res);
+  });
+  await withBigServer(up, '/firstdrop', async (port) => {
+    const r = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, big);
+  });
+  assert.equal(dropped, true, 'the drop really happened');
+});
+
+test('a chunk that ends short resumes and completes', async () => {
+  // The second chunk's first attempt ends cleanly after 512 bytes
+  // although its Content-Range promises the whole chunk. The byte
+  // count exposes the lie; kikoeru resumes at the missing byte.
+  const big = makeData(CHUNK_SIZE + 1024);
+  let shortened = false;
+  const up = http.createServer((req, res) => {
+    const m = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
+    if (!m) {
+      res.writeHead(416);
+      res.end();
+      return;
+    }
+    const s = Number(m[1]);
+    const e = Number(m[2]);
+    if (s >= CHUNK_SIZE && !shortened) {
+      shortened = true;
+      res.writeHead(206, {
+        'Content-Type': 'audio/mp4',
+        'Content-Range': `bytes ${s}-${e}/${big.length}`,
+        'Content-Length': 512,
+      });
+      res.end(big.subarray(s, s + 512));
+      return;
+    }
+    serveBigRange(big, req, res);
+  });
+  await withBigServer(up, '/short', async (port) => {
+    const r = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, big);
+  });
+  assert.equal(shortened, true, 'the short chunk really happened');
+});
+
+test('a later chunk failure with nothing to refresh to cuts the response', async () => {
+  // The second chunk 403s and the batch cache has been emptied in
+  // the meantime, so the resume has no URL to retry with. The
+  // response, already committed, is cut short instead of hanging.
+  const big = makeData(CHUNK_SIZE + 1024);
+  const up = http.createServer((req, res) => {
+    const m = /^bytes=(\d+)-/.exec(req.headers.range || '');
+    const s = m ? Number(m[1]) : 0;
+    if (s >= CHUNK_SIZE) {
+      writeCache(cacheFile, {});
+      res.writeHead(403);
+      res.end();
+      return;
+    }
+    serveBigRange(big, req, res);
+  });
+  const upPort3 = await listen(up);
+  writeCache(cacheFile, {
+    [VIDEO_ID]: { url: `http://127.0.0.1:${upPort3}/vanish`, ts: nowSec() },
+  });
+  const p = createServer({
+    host: '127.0.0.1',
+    port: 0,
+    token: TOKEN,
+    tokenFile: path.join(tmp, 'token'),
+    batchCacheFile: cacheFile,
+  });
+  const port = await listen(p);
+  try {
+    const r = await getObserveEnd(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.timedOut, false, 'kikoeru must end the response, not hang');
+    assert.equal(r.status, 200);
+    assert.equal(r.bytes, CHUNK_SIZE, 'only the first chunk was delivered');
+    assert.equal(r.complete, false, 'the body ends incomplete');
+  } finally {
+    await close(p);
+    await close(up);
+  }
+});
+
+test('a later chunk failure whose refresh probe fails cuts the response', async () => {
+  // The second chunk 403s and the refreshed cache URL is broken too
+  // (its probe answers 500), so the resume cannot even re-resolve.
+  // The committed response is cut short instead of hanging.
+  const big = makeData(CHUNK_SIZE + 1024);
+  const up = http.createServer((req, res) => {
+    const pathname = (req.url || '').split('?')[0];
+    if (pathname === '/badprobe') {
+      res.writeHead(500);
+      res.end();
+      return;
+    }
+    const m = /^bytes=(\d+)-/.exec(req.headers.range || '');
+    const s = m ? Number(m[1]) : 0;
+    if (s >= CHUNK_SIZE) {
+      writeCache(cacheFile, {
+        [VIDEO_ID]: {
+          url: `http://127.0.0.1:${up.address().port}/badprobe`,
+          ts: nowSec(),
+        },
+      });
+      res.writeHead(403);
+      res.end();
+      return;
+    }
+    serveBigRange(big, req, res);
+  });
+  const upPort4 = await listen(up);
+  writeCache(cacheFile, {
+    [VIDEO_ID]: { url: `http://127.0.0.1:${upPort4}/die`, ts: nowSec() },
+  });
+  const p = createServer({
+    host: '127.0.0.1',
+    port: 0,
+    token: TOKEN,
+    tokenFile: path.join(tmp, 'token'),
+    batchCacheFile: cacheFile,
+  });
+  const port = await listen(p);
+  try {
+    const r = await getObserveEnd(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.timedOut, false, 'kikoeru must end the response, not hang');
+    assert.equal(r.status, 200);
+    assert.equal(r.bytes, CHUNK_SIZE, 'only the first chunk was delivered');
+    assert.equal(r.complete, false, 'the body ends incomplete');
+  } finally {
+    await close(p);
+    await close(up);
+  }
 });
 
 test('upstream connection refused gives 404', async () => {
