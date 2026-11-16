@@ -23,7 +23,13 @@
  *   - entry missing or expired -> 404 (the shell refreshes it on its cycle).
  * If the upstream answers 403 (URL expired server-side), the batch cache
  * is re-read once (the shell may have refreshed it in the meantime) and
- * the request is retried; if that still fails, the answer is 404.
+ * the request is retried; if that still fails, the answer is 404. The
+ * probe is retried the same way on any other failure (a timeout, a
+ * 5xx), and when even the retry fails, the last metadata probed for
+ * the video is served stale rather than answering 404: its size and
+ * type do not change, and a stream URL that died in the meantime
+ * still surfaces as a 403 on the chunk fetch, which the retry path
+ * handles.
  *
  * Redirects are followed for every chunk request, not just the probe:
  * googlevideo redirects data chunks too, and an unfollowed redirect
@@ -234,9 +240,11 @@ async function getMeta(cfg, state, videoId, force = false) {
   try {
     probed = await probeMeta(url);
   } catch (e) {
-    if (e.code === 'UPSTREAM_EXPIRED' && !force) {
-      // The shell may have refreshed the cache since we last read it;
-      // re-read it once and retry before giving up with a 404.
+    if (!force) {
+      // Re-read the batch cache once and retry, whatever the error
+      // was: on a 403 the shell may have refreshed the URL, and on a
+      // transient failure (a timeout, a 5xx) the second attempt
+      // often answers even with the same URL.
       return getMeta(cfg, state, videoId, true);
     }
     throw e;
@@ -296,6 +304,17 @@ async function handle(cfg, state, token, req, res) {
     } catch (e) {
       console.error(`[kikoeru] meta failed for ${videoId}: ${e.message}`);
       meta = null;
+    }
+    if (!meta) {
+      // Fall back to the last metadata this process probed, however
+      // old: a video's size and type do not change, and if its stream
+      // URL has died since, the chunk fetch below surfaces that as a
+      // 403 the retry path already handles. A probe outage must not
+      // turn a playable video into a 404.
+      meta = state.meta.get(videoId) || null;
+      if (meta) {
+        console.error(`[kikoeru] serving stale meta for ${videoId}`);
+      }
     }
     if (!meta) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });

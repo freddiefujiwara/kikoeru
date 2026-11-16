@@ -36,6 +36,7 @@ let tmp;
 let hits; // per-path request counts
 let cacheFile; // the batch cache the running kikoeru reads
 let onFlakyChunk; // hook fired when /flaky gets a data (non-probe) request
+let probeHits; // probe (bytes=0-0) count for /flakyprobe
 
 function serveRange(req, res) {
   const m = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
@@ -112,6 +113,19 @@ before(async () => {
         }
         res.writeHead(302, { Location: '/loopredir' });
         res.end();
+        return;
+      case '/flakyprobe':
+        // The first probe fails with a 500; everything after that
+        // is served normally.
+        if (range === 'bytes=0-0') {
+          probeHits = (probeHits || 0) + 1;
+          if (probeHits === 1) {
+            res.writeHead(500);
+            res.end();
+            return;
+          }
+        }
+        serveRange(req, res);
         return;
       case '/probe500':
         res.writeHead(500);
@@ -243,6 +257,18 @@ test('a redirect loop on a data chunk gives a prompt 502', async () => {
     assert.equal(r.timedOut, false, 'kikoeru must answer, not hang');
     assert.equal(r.status, 502);
   });
+});
+
+test('a failed probe is retried once and recovers', async () => {
+  // A transient probe failure (here a 500) must not become a 404:
+  // the probe is retried once, like the 403 path already did.
+  probeHits = 0;
+  await withServerAt('/flakyprobe', async (port) => {
+    const r = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, data);
+  });
+  assert.equal(probeHits, 2, 'the failed probe was retried exactly once');
 });
 
 test('500 on the probe gives 404', async () => {
@@ -640,6 +666,54 @@ test('a later chunk failure whose refresh probe fails cuts the response', async 
     assert.equal(r.status, 200);
     assert.equal(r.bytes, CHUNK_SIZE, 'only the first chunk was delivered');
     assert.equal(r.complete, false, 'the body ends incomplete');
+  } finally {
+    await close(p);
+    await close(up);
+  }
+});
+
+test('stale meta is served when the re-probe keeps failing', async () => {
+  // The metadata TTL is 1 ms, so the second request must re-probe.
+  // With the probes down (500) both attempts fail, and kikoeru falls
+  // back to the metadata from the first request instead of 404ing:
+  // the data ranges are still served, so playback continues.
+  let probesDown = false;
+  let probeAttempts = 0;
+  const up = http.createServer((req, res) => {
+    const range = req.headers.range || '';
+    if (range === 'bytes=0-0') {
+      probeAttempts++;
+      if (probesDown) {
+        res.writeHead(500);
+        res.end();
+        return;
+      }
+    }
+    serveBigRange(data, req, res);
+  });
+  const upPort5 = await listen(up);
+  writeCache(cacheFile, {
+    [VIDEO_ID]: { url: `http://127.0.0.1:${upPort5}/media`, ts: nowSec() },
+  });
+  const p = createServer({
+    host: '127.0.0.1',
+    port: 0,
+    token: TOKEN,
+    tokenFile: path.join(tmp, 'token'),
+    batchCacheFile: cacheFile,
+    metaTtlMs: 1,
+  });
+  const port = await listen(p);
+  try {
+    const r1 = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r1.status, 200);
+    assert.deepEqual(r1.body, data);
+    probesDown = true;
+    probeAttempts = 0;
+    const r2 = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r2.status, 200, 'stale meta keeps the video playable');
+    assert.deepEqual(r2.body, data);
+    assert.equal(probeAttempts, 2, 'the re-probe was tried, then retried');
   } finally {
     await close(p);
     await close(up);
