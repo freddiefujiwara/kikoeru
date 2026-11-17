@@ -247,16 +247,16 @@ starts at boot and keeps running after logout.
 ## Reverse proxy
 
 kikoeru only listens on the local machine, so we publish it with nginx
-on its own host name. In this example the host is `y.ze.gs` and the
+on its own host name. In this example the host is `stream.example.com` and the
 whole site is passed to kikoeru:
 
 ```nginx
 server {
     listen 443 ssl;
-    server_name y.ze.gs;
+    server_name stream.example.com;
 
-    ssl_certificate     /etc/letsencrypt/live/ze.gs/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/ze.gs/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/stream.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/stream.example.com/privkey.pem;
 
     location / {
         proxy_pass http://127.0.0.1:8791;
@@ -271,7 +271,7 @@ server {
 }
 ```
 
-Then a listener uses `https://y.ze.gs/<token>/<videoId>`. Notes:
+Then a listener uses `https://stream.example.com/<token>/<videoId>`. Notes:
 
 - `proxy_buffering off` matters: the sound must flow to the listener
   as it arrives, not after nginx has collected a big part of it.

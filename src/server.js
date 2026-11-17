@@ -10,7 +10,7 @@
  * stream in small (<= 4 MiB) ranged chunks and forwards the bytes as they
  * arrive. Nothing is stored on disk.
  *
- * Route: GET /<token>/<videoId>  (served at the root of https://y.ze.gs/)
+ * Route: GET /<token>/<videoId>  (served at the root of the public host)
  *   - token: shared secret read from a token file (generated on first run).
  *   - videoId: 11-char YouTube video id.
  *
