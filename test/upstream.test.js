@@ -37,6 +37,9 @@ let hits; // per-path request counts
 let cacheFile; // the batch cache the running kikoeru reads
 let onFlakyChunk; // hook fired when /flaky gets a data (non-probe) request
 let probeHits; // probe (bytes=0-0) count for /flakyprobe
+let flakyChunkHits; // data (non-probe) request count for /chunkflaky
+let resetChunkHits; // data (non-probe) request count for /chunkreset
+let onGoneChunk; // hook fired when /chunk410 gets a data (non-probe) request
 
 function serveRange(req, res) {
   const m = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
@@ -138,6 +141,47 @@ before(async () => {
           return;
         }
         res.writeHead(500);
+        res.end();
+        return;
+      case '/chunkflaky':
+        // Probe succeeds; the first data chunk fails with a 500 and
+        // every later attempt is served normally.
+        if (range === 'bytes=0-0') {
+          serveRange(req, res);
+          return;
+        }
+        flakyChunkHits = (flakyChunkHits || 0) + 1;
+        if (flakyChunkHits === 1) {
+          res.writeHead(500);
+          res.end();
+          return;
+        }
+        serveRange(req, res);
+        return;
+      case '/chunkreset':
+        // Probe succeeds; the first data chunk's connection dies
+        // before any response, later attempts are served normally.
+        if (range === 'bytes=0-0') {
+          serveRange(req, res);
+          return;
+        }
+        resetChunkHits = (resetChunkHits || 0) + 1;
+        if (resetChunkHits === 1) {
+          req.socket.destroy();
+          return;
+        }
+        serveRange(req, res);
+        return;
+      case '/chunk410':
+        // Probe succeeds, data chunks get a 410 (the other status
+        // googlevideo uses for a dead stream URL). The hook
+        // refreshes the batch cache to /good before answering.
+        if (range === 'bytes=0-0') {
+          serveRange(req, res);
+          return;
+        }
+        if (onGoneChunk) onGoneChunk();
+        res.writeHead(410);
         res.end();
         return;
       default:
@@ -286,6 +330,57 @@ test('500 on a data chunk gives a prompt 502', async () => {
     assert.equal(r.timedOut, false, 'kikoeru must answer, not hang');
     assert.equal(r.status, 502);
   });
+});
+
+test('a 500 on the first data chunk is retried and recovers', async () => {
+  // The first chunk decides the status line, so its open used to
+  // have no recovery at all: one transient 500 became an instant
+  // 502 even though the same failure a chunk later is resumed. The
+  // open is now retried after re-resolving the stream URL.
+  flakyChunkHits = 0;
+  await withServerAt('/chunkflaky', async (port) => {
+    const r = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, data);
+  });
+  assert.equal(flakyChunkHits, 2, 'the failed open was retried once');
+});
+
+test('a reset on the first data chunk is retried and recovers', async () => {
+  // Same gap as the 500 case, at the connection level: the socket
+  // dies before any response arrives.
+  resetChunkHits = 0;
+  await withServerAt('/chunkreset', async (port) => {
+    const r = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, data);
+  });
+  assert.equal(resetChunkHits, 2, 'the reset open was retried once');
+});
+
+test('410 on the first data chunk retries with the refreshed cache URL', async () => {
+  // 410 is googlevideo's other dead-URL answer; it must take the
+  // same expiry path as 403 (re-read the batch cache, retry once),
+  // not the instant-502 path for unexpected statuses.
+  hits = {};
+  onGoneChunk = () => {
+    writeCache(cacheFile, {
+      [VIDEO_ID]: {
+        url: `http://127.0.0.1:${upPort}/good`,
+        ts: nowSec(),
+      },
+    });
+  };
+  try {
+    await withServerAt('/chunk410', async (port) => {
+      const r = await get(port, `/${TOKEN}/${VIDEO_ID}`);
+      assert.equal(r.status, 200);
+      assert.deepEqual(r.body, data);
+    });
+  } finally {
+    onGoneChunk = null;
+  }
+  assert.ok(hits['/good'] >= 2, 'the refreshed URL is probed and streamed');
 });
 
 // Fetch and report how the exchange ended: { status, bytes,
