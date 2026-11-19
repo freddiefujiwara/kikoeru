@@ -21,9 +21,10 @@
  *     (The URL's own `expire` parameter decides; a URL without one is
  *     used until 6 h after its extraction time.)
  *   - entry missing or expired -> 404 (the shell refreshes it on its cycle).
- * If the upstream answers 403 (URL expired server-side), the batch cache
- * is re-read once (the shell may have refreshed it in the meantime) and
- * the request is retried; if that still fails, the answer is 404. The
+ * If the upstream answers 403 or 410 (URL expired server-side), the
+ * batch cache is re-read once (the shell may have refreshed it in the
+ * meantime) and the request is retried; if that still fails, the
+ * answer is 404. The
  * probe is retried the same way on any other failure (a timeout, a
  * 5xx), and when even the retry fails, the last metadata probed for
  * the video is served stale rather than answering 404: its size and
@@ -37,6 +38,14 @@
  * fails partway through is resumed from the first byte the client is
  * missing, after re-resolving the stream URL; only when the resume
  * also fails is the response cut short.
+ *
+ * The first chunk of a response is retried the same way when opening
+ * it fails transiently (a 5xx, a reset, a timeout): that open decides
+ * the status line, so an unretried failure there surfaced as an
+ * instant 502 even though the identical failure one chunk later was
+ * quietly resumed. Under a burst of ranged requests (a client
+ * arming its preload, say) roughly every third first-chunk open can
+ * fail this way, which the client then reports as a load error.
  *
  * A failure while streaming is always answered, never left hanging:
  * before the response is committed the client gets a 502, and once
@@ -52,6 +61,7 @@ const crypto = require('node:crypto');
 
 const CHUNK_SIZE = 4 * 1024 * 1024; // upstream sub-range size
 const MAX_STREAM_RECOVERIES = 2; // consecutive resumes per chunk position
+const MAX_FIRST_CHUNK_RETRIES = 2; // re-opens of a response's first chunk
 const FALLBACK_FRESH_SEC = 6 * 3600; // no expire param: ts + 6 h decides
 const EXPIRY_MARGIN_SEC = 60; // stop serving this long before a URL expires
 const META_TTL_MS = 50 * 60 * 1000; // resolved size/type/final-URL cache
@@ -177,8 +187,8 @@ function openUpstream(url, headers) {
   });
 }
 
-function expiredError() {
-  const e = new Error('upstream returned 403 (stream URL expired)');
+function expiredError(status) {
+  const e = new Error(`upstream returned ${status} (stream URL expired)`);
   e.code = 'UPSTREAM_EXPIRED';
   return e;
 }
@@ -202,9 +212,9 @@ async function openChunk(startUrl, start, end) {
       url = new URL(location, url).toString();
       continue;
     }
-    if (status === 403) {
+    if (status === 403 || status === 410) {
       res.destroy();
-      throw expiredError();
+      throw expiredError(status);
     }
     if (status !== 206) {
       res.destroy();
@@ -280,6 +290,33 @@ function tokenMatches(given, expected) {
   const a = Buffer.from(given);
   const b = Buffer.from(expected);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Open the first chunk of a response. This open decides the status
+ * line, so it is the one chunk fetch that cannot resume quietly the
+ * way streamRange does: an unretried transient failure here (a 5xx,
+ * a reset, a timeout) used to surface as an instant 502, even though
+ * the identical failure one chunk later is absorbed. Give it the
+ * same kind of recovery: re-resolve the stream URL via refresh()
+ * and retry, up to MAX_FIRST_CHUNK_RETRIES times. An expired URL
+ * (403/410) is not retried here; it propagates so the caller runs
+ * its own whole-request retry against a re-read batch cache.
+ */
+async function openFirstChunk(refresh, url, start, end) {
+  let current = url;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await openChunk(current, start, end);
+    } catch (e) {
+      if (e.code === 'UPSTREAM_EXPIRED' || attempt >= MAX_FIRST_CHUNK_RETRIES) {
+        throw e;
+      }
+      const fresh = await refresh();
+      if (!fresh) throw e;
+      current = fresh;
+    }
+  }
 }
 
 async function handle(cfg, state, token, req, res) {
@@ -363,7 +400,7 @@ async function handle(cfg, state, token, req, res) {
     };
     try {
       const firstEnd = Math.min(start + cfg.chunkSize - 1, end);
-      const first = await openChunk(meta.finalUrl, start, firstEnd);
+      const first = await openFirstChunk(refresh, meta.finalUrl, start, firstEnd);
       tracker.committed = true;
       res.writeHead(range ? 206 : 200, headers);
       const counter = { n: 0 };
