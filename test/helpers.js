@@ -6,6 +6,7 @@
 // off the real network.
 
 const http = require('node:http');
+const net = require('node:net');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -149,12 +150,75 @@ function parseRangeHeader(range) {
   return m ? [Number(m[1]), Number(m[2])] : null;
 }
 
+// Raw HTTP/1.1 GET over a bare socket with Connection: close.
+// Unlike request(), this reports the body bytes exactly as they
+// arrived on the wire (de-chunked when the response is chunked), so
+// a relay that emits MORE bytes than its declared Content-Length,
+// or cuts the response short, is observable instead of being
+// normalised away by the HTTP client. Resolves { status,
+// contentLength, body, timedOut }; a response that never ends
+// resolves with timedOut: true and whatever arrived.
+function getRawWire(port, p, headers = {}, ms = 3000) {
+  return new Promise((resolve) => {
+    let done = false;
+    let timedOut = false;
+    const chunks = [];
+    const finish = () => {
+      if (done) return;
+      done = true;
+      const raw = Buffer.concat(chunks);
+      const idx = raw.indexOf('\r\n\r\n');
+      if (idx === -1) {
+        resolve({ status: null, contentLength: null, body: raw, timedOut });
+        return;
+      }
+      const head = raw.subarray(0, idx).toString('latin1');
+      let body = raw.subarray(idx + 4);
+      if (/transfer-encoding:\s*chunked/i.test(head)) {
+        const out = [];
+        let rest = body;
+        for (;;) {
+          const eol = rest.indexOf('\r\n');
+          if (eol === -1) break;
+          const n = parseInt(rest.subarray(0, eol).toString('latin1'), 16);
+          if (!Number.isFinite(n) || n <= 0) break;
+          out.push(rest.subarray(eol + 2, eol + 2 + n));
+          rest = rest.subarray(eol + 2 + n + 2);
+        }
+        body = Buffer.concat(out);
+      }
+      const sm = /HTTP\/1\.1 (\d+)/.exec(head);
+      const cl = /content-length:\s*(\d+)/i.exec(head);
+      resolve({
+        status: sm ? Number(sm[1]) : null,
+        contentLength: cl ? Number(cl[1]) : null,
+        body,
+        timedOut,
+      });
+    };
+    const sock = net.connect(port, '127.0.0.1', () => {
+      const lines = [`GET ${p} HTTP/1.1`, 'Host: 127.0.0.1', 'Connection: close'];
+      for (const [k, v] of Object.entries(headers)) lines.push(`${k}: ${v}`);
+      sock.write(lines.join('\r\n') + '\r\n\r\n');
+    });
+    sock.on('data', (c) => chunks.push(c));
+    sock.on('end', finish);
+    sock.on('error', finish);
+    sock.setTimeout(ms, () => {
+      timedOut = true;
+      sock.destroy();
+      finish();
+    });
+  });
+}
+
 module.exports = {
   listen,
   close,
   request,
   get,
   getExpectTimeout,
+  getRawWire,
   makeData,
   tmpDir,
   writeCache,

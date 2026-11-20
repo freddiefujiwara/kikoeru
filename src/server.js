@@ -203,7 +203,9 @@ function expiredError(status) {
  */
 async function openChunk(startUrl, start, end) {
   let url = startUrl;
-  for (let i = 0; i < 5; i++) {
+  // Up to 5 redirects are followed; the request that the fifth
+  // redirect points at still has to be made, hence <=.
+  for (let i = 0; i <= 5; i++) {
     const res = await openUpstream(url, { Range: `bytes=${start}-${end}` });
     const status = res.statusCode || 0;
     const location = res.headers.location;
@@ -219,6 +221,20 @@ async function openChunk(startUrl, start, end) {
     if (status !== 206) {
       res.destroy();
       throw new Error(`unexpected chunk status ${status}`);
+    }
+    // A 206 whose Content-Range names different bytes than the ones
+    // requested would hand the client the wrong audio under the
+    // right offsets, with no sign of error. Refuse it; the caller's
+    // retry/resume machinery treats it like any other chunk
+    // failure. A missing Content-Range is tolerated: the byte
+    // count still bounds what the chunk can contribute.
+    const cr = res.headers['content-range'];
+    if (cr) {
+      const cm = /^bytes (\d+)-(\d+)\/(?:\d+|\*)$/.exec(cr.trim());
+      if (!cm || Number(cm[1]) !== start || Number(cm[2]) !== end) {
+        res.destroy();
+        throw new Error(`unexpected Content-Range: ${cr}`);
+      }
     }
     return { res, finalUrl: url };
   }
@@ -274,8 +290,12 @@ function parseRange(header, size) {
   let start;
   let end;
   if (a === '') {
+    // b is a non-empty digit string here, so n is a positive
+    // number — or Infinity when the digits overflow. An infinite
+    // suffix is just a very long one: like any suffix longer than
+    // the file, it clamps to the whole file via size - n below.
     const n = Number(b);
-    if (!Number.isFinite(n) || n <= 0) return 'unsatisfiable';
+    if (n <= 0) return 'unsatisfiable';
     start = Math.max(0, size - n);
     end = size - 1;
   } else {
@@ -406,7 +426,7 @@ async function handle(cfg, state, token, req, res) {
       const counter = { n: 0 };
       let gone = false;
       try {
-        gone = await writeBody(first.res, res, tracker, counter);
+        gone = await writeBody(first.res, res, tracker, counter, firstEnd - start + 1);
       } catch {
         // The first chunk died partway; streamRange below resumes
         // from the first byte the client is missing.
@@ -458,17 +478,36 @@ async function handle(cfg, state, token, req, res) {
  * partway and the iteration throws, so the caller knows exactly
  * which byte to resume from. Returns true when the client went away
  * mid-write and the caller should stop quietly.
+ *
+ * At most `limit` bytes are written — the length of the range this
+ * body answers. An upstream that sends more than its range (a
+ * chunked body has no Content-Length to stop at) has the excess
+ * discarded and is closed: those bytes belong to no requested
+ * position, and relaying them would corrupt the stream and
+ * overrun the Content-Length the client was promised.
  */
-async function writeBody(up, res, tracker, counter) {
+async function writeBody(up, res, tracker, counter, limit = Infinity) {
   for await (const buf of up) {
     if (res.destroyed || res.writableEnded) {
       up.destroy();
       return true;
     }
-    tracker.wrote = true;
-    counter.n += buf.length;
-    if (!res.write(buf)) {
-      await new Promise((resolve) => res.once('drain', resolve));
+    const room = limit - counter.n;
+    if (room <= 0) {
+      up.destroy();
+      return false;
+    }
+    const slice = buf.length <= room ? buf : buf.subarray(0, room);
+    if (slice.length > 0) {
+      tracker.wrote = true;
+      counter.n += slice.length;
+      if (!res.write(slice)) {
+        await new Promise((resolve) => res.once('drain', resolve));
+      }
+    }
+    if (slice.length < buf.length) {
+      up.destroy();
+      return false;
     }
   }
   return false;
@@ -493,7 +532,7 @@ async function streamRange({ url, refresh, start, end, res, tracker, chunkSize }
     try {
       const chunk = await openChunk(current, pos, chunkEnd);
       current = chunk.finalUrl;
-      const gone = await writeBody(chunk.res, res, tracker, counter);
+      const gone = await writeBody(chunk.res, res, tracker, counter, chunkEnd - pos + 1);
       if (gone || res.destroyed || res.writableEnded) return;
       if (counter.n !== chunkEnd - pos + 1) {
         throw new Error(
